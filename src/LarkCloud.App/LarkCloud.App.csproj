@@ -1,0 +1,40 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>true</UseWPF>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>LarkCloud</AssemblyName>
+    <RootNamespace>LarkCloud.App</RootNamespace>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <Version>0.1.0</Version>
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
+    <Product>Lark Cloud Drive</Product>
+    <Company>Revion Land IT</Company>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <DebugType>embedded</DebugType>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- WPF and WinForms both define Button, Color, Application...; the WinForms files import what they need. -->
+    <Using Remove="System.Windows.Forms" />
+    <Using Remove="System.Drawing" />
+    <!-- the WPF SDK drops these two implicit usings; the rest of the app relies on them -->
+    <Using Include="System.IO" />
+    <Using Include="System.Net.Http" />
+  </ItemGroup>
+  <ItemGroup>
+    <Resource Include="Assets\app.ico" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\LarkCloud.Core\LarkCloud.Core.csproj" />
+  </ItemGroup>
+</Project>

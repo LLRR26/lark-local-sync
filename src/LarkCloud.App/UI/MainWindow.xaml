@@ -1,0 +1,149 @@
+﻿<Window x:Class="LarkCloud.App.UI.MainWindow" x:ClassModifier="internal"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Style="{StaticResource AppWindow}" Title="Lark Cloud Drive"
+        Width="980" Height="660" MinWidth="760" MinHeight="500" WindowStartupLocation="CenterScreen">
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="240"/>
+            <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- ============================================ navigation -->
+        <Grid Margin="8,8,8,12">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <StackPanel Orientation="Horizontal" Margin="12,8,12,20">
+                <Image x:Name="Logo" Width="24" Height="24" RenderOptions.BitmapScalingMode="Fant"/>
+                <TextBlock Text="Lark Cloud Drive" Style="{StaticResource BodyStrongText}" Margin="12,0,0,0" VerticalAlignment="Center" TextWrapping="NoWrap"/>
+            </StackPanel>
+
+            <Grid Grid.Row="1">
+            <Border x:Name="NavBar" Width="3" Height="16" CornerRadius="1.5" HorizontalAlignment="Left" VerticalAlignment="Top" IsHitTestVisible="False"
+                    Background="{DynamicResource AccentBrush}" Visibility="Collapsed" Panel.ZIndex="1">
+                <Border.RenderTransform><TranslateTransform x:Name="NavBarT"/></Border.RenderTransform>
+            </Border>
+            <StackPanel x:Name="NavStack" KeyboardNavigation.DirectionalNavigation="Cycle">
+                <RadioButton x:Name="NavFolders" GroupName="nav" Style="{StaticResource NavItem}" Checked="Nav_Checked">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Style="{StaticResource IconText}" Text="&#xE8B7;" Width="24" Margin="0,0,12,0"/>
+                        <TextBlock Text="Folders" TextWrapping="NoWrap" VerticalAlignment="Center"/>
+                    </StackPanel>
+                </RadioButton>
+                <RadioButton x:Name="NavProblems" GroupName="nav" Style="{StaticResource NavItem}" Checked="Nav_Checked">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Style="{StaticResource IconText}" Text="&#xE7BA;" Width="24" Margin="0,0,12,0"/>
+                        <TextBlock Grid.Column="1" Text="Files that can't sync" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                        <Border x:Name="ProblemsBadge" Grid.Column="2" MinWidth="20" Height="20" CornerRadius="10" Padding="6,0" Margin="8,0,0,0"
+                                Background="{DynamicResource CautionBgBrush}" Visibility="Collapsed">
+                            <TextBlock x:Name="ProblemsCount" FontSize="12" FontWeight="SemiBold" Foreground="{DynamicResource CautionBrush}"
+                                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                    </Grid>
+                </RadioButton>
+                <RadioButton x:Name="NavSettings" GroupName="nav" Style="{StaticResource NavItem}" Checked="Nav_Checked">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Style="{StaticResource IconText}" Text="&#xE713;" Width="24" Margin="0,0,12,0"/>
+                        <TextBlock Text="Settings" TextWrapping="NoWrap" VerticalAlignment="Center"/>
+                    </StackPanel>
+                </RadioButton>
+            </StackPanel>
+            </Grid>
+
+            <StackPanel Grid.Row="3" Margin="4,0,4,0">
+                <Border Height="1" Background="{DynamicResource DividerBrush}" Margin="4,0,4,12"/>
+                <Grid Margin="8,0,8,8">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <Border x:Name="Avatar" Width="32" Height="32" CornerRadius="16" Margin="0,0,12,0">
+                        <Grid>
+                            <TextBlock x:Name="AvatarInitial" FontWeight="SemiBold" Foreground="{DynamicResource OnAccentBrush}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            <TextBlock x:Name="AvatarGlyph" Style="{StaticResource IconText}" Text="&#xE77B;" Foreground="{DynamicResource TextSecondaryBrush}"/>
+                        </Grid>
+                    </Border>
+                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                        <TextBlock x:Name="AccountLine" Style="{StaticResource CaptionText}" TextWrapping="NoWrap"/>
+                        <TextBlock x:Name="AccountName" Style="{StaticResource BodyStrongText}" TextTrimming="CharacterEllipsis" TextWrapping="NoWrap"/>
+                    </StackPanel>
+                </Grid>
+                <Button x:Name="AccountButton" Style="{StaticResource SubtleButton}" HorizontalContentAlignment="Left" Padding="12,0" Click="Account_Click"/>
+            </StackPanel>
+        </Grid>
+
+        <!-- ============================================ content -->
+        <Border Grid.Column="1" Background="{DynamicResource LayerBrush}" BorderBrush="{DynamicResource CardStrokeBrush}"
+                BorderThickness="1,1,0,0" CornerRadius="8,0,0,0">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+
+                <!-- status header -->
+                <Grid x:Name="HeaderArea" Margin="32,24,32,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock x:Name="StateGlyph" Style="{StaticResource IconText}" FontSize="32" Width="40" Margin="0,0,16,0"/>
+                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                        <TextBlock x:Name="Sentence" Style="{StaticResource SubtitleText}" AutomationProperties.LiveSetting="Polite"/>
+                        <TextBlock x:Name="Detail" Style="{StaticResource BodySecondaryText}" Margin="0,2,0,0"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0">
+                        <Button x:Name="ActionButton" Style="{StaticResource AccentButton}" Click="Action_Click" Margin="0,0,8,0" Visibility="Collapsed"/>
+                        <Button x:Name="SyncNow" Click="SyncNow_Click" Margin="0,0,8,0">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock x:Name="SyncIcon" Style="{StaticResource IconText}" Text="&#xE895;" FontSize="14" Margin="0,0,8,0"/>
+                                <TextBlock Text="Sync now" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </Button>
+                        <Button x:Name="PauseButton" Click="Pause_Click">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock x:Name="PauseGlyph" Style="{StaticResource IconText}" Text="&#xE769;" FontSize="14" Margin="0,0,8,0"/>
+                                <TextBlock x:Name="PauseText" Text="Pause" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </Button>
+                    </StackPanel>
+                </Grid>
+
+                <!-- attention banners: one fixing action each -->
+                <StackPanel x:Name="Banners" Grid.Row="1" Margin="32,16,32,0">
+                    <Border x:Name="ProblemsBar" Style="{StaticResource InfoBar}" Background="{DynamicResource CautionBgBrush}" BorderBrush="{DynamicResource CardStrokeBrush}" Margin="0,0,0,8" Visibility="Collapsed">
+                        <Grid>
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                            <TextBlock Style="{StaticResource IconText}" Text="&#xE7BA;" Foreground="{DynamicResource CautionBrush}" Margin="0,0,12,0"/>
+                            <TextBlock x:Name="ProblemsText" Grid.Column="1" Style="{StaticResource BodyText}" VerticalAlignment="Center"/>
+                            <Button Grid.Column="2" Content="Review" Margin="16,0,0,0" Click="ReviewProblems_Click"/>
+                        </Grid>
+                    </Border>
+                    <Border x:Name="DeletionsBar" Style="{StaticResource InfoBar}" Background="{DynamicResource CautionBgBrush}" BorderBrush="{DynamicResource CardStrokeBrush}" Margin="0,0,0,8" Visibility="Collapsed">
+                        <Grid>
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                            <TextBlock Style="{StaticResource IconText}" Text="&#xE7BA;" Foreground="{DynamicResource CautionBrush}" Margin="0,0,12,0"/>
+                            <TextBlock x:Name="DeletionsText" Grid.Column="1" Style="{StaticResource BodyText}" VerticalAlignment="Center"/>
+                            <Button Grid.Column="2" Content="Review" Margin="16,0,0,0" Click="ReviewDeletions_Click"/>
+                        </Grid>
+                    </Border>
+                </StackPanel>
+
+                <!-- the current page (Folders, Files that can't sync, Settings) -->
+                <ContentControl x:Name="PageHost" Grid.Row="2" IsTabStop="False" Margin="32,8,20,0"/>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>
