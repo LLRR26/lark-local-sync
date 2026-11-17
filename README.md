@@ -22,6 +22,7 @@ Both apps can be installed side by side. They must not use the same PC folder.
 * Right-click any file or folder:
   * **Always keep on this device** – download it now and keep it (for working offline).
   * **Free up space** – remove the local copy; it stays listed and downloads again when opened.
+* In the app's Folders list, the ⋯ menu has **Rename on this PC…**: it renames only the folder on the PC (the Lark folder keeps its name) and keeps syncing from the new path. Not shown for folders your IT team manages.
 * A tray icon (blue cloud) with a coloured dot: green = up to date, blue = syncing, amber = something needs a look,
   red = can't sync (for example signed out). Left-click opens what needs attention.
 

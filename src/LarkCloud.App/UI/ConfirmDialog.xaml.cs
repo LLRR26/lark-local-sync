@@ -6,7 +6,7 @@ namespace LarkCloud.App.UI;
 /// <see cref="Tell"/> is the same window with one button, for things that only need reading.</summary>
 internal sealed partial class ConfirmDialog : Window
 {
-    ConfirmDialog(string heading, string message, string confirmText, bool destructive, bool tellOnly = false)
+    ConfirmDialog(string heading, string message, string confirmText, bool destructive, bool tellOnly = false, string? input = null)
     {
         InitializeComponent();
         Title = LarkCloud.Core.AppPaths.AppTitle;
@@ -19,7 +19,21 @@ internal sealed partial class ConfirmDialog : Window
         No.IsDefault = destructive;
         if (tellOnly) { No.Visibility = Visibility.Collapsed; Yes.IsDefault = Yes.IsCancel = true; }
         Theme.Attach(this, mica: false);
-        Loaded += (_, _) => (destructive ? No : Yes).Focus();
+        if (input != null) Input.Visibility = Visibility.Visible;
+        Input.Text = input ?? "";
+        Loaded += (_, _) =>
+        {
+            if (input != null) { Input.Focus(); Input.SelectAll(); }
+            else (destructive ? No : Yes).Focus();
+        };
+    }
+
+    /// <summary>Asks for one line of text (prefilled); null when cancelled.</summary>
+    public static string? AskText(Window? owner, string heading, string message, string confirmText, string initial)
+    {
+        var d = new ConfirmDialog(heading, message, confirmText, false, input: initial);
+        Place(d, owner);
+        return d.ShowDialog() == true ? d.Input.Text : null;
     }
 
     void Yes_Click(object sender, RoutedEventArgs e) => DialogResult = true;

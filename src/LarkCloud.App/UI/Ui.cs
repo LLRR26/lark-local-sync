@@ -40,7 +40,7 @@ internal static class Ui
     public static Icon AppIcon => TrayIcons.AppIcon;
 
     /// <summary>Can this PC folder hold a Lark cloud folder? (error, warning)</summary>
-    public static (string? Error, string? Warning) CheckPcFolder(string path, Config cfg)
+    public static (string? Error, string? Warning) CheckPcFolder(string path, Config cfg, string? excludePairId = null)
     {
         if (string.IsNullOrWhiteSpace(path)) return ("Choose a folder on this PC.", null);
         string full;
@@ -71,7 +71,7 @@ internal static class Ui
         foreach (var special in new[] { "Desktop", "Documents", "Downloads", "Pictures", "Videos", "Music" })
             if (string.Equals(full.TrimEnd('\\'), Path.Combine(home, special), StringComparison.OrdinalIgnoreCase))
                 return ($"Your whole {special} folder can't be used. Create a new folder inside it (for example {special}\\Lark Cloud) and choose that.", null);
-        if (cfg.LocalOverlap(full) is { } o) return (o, null);
+        if (cfg.LocalOverlap(full, excludePairId) is { } o) return (o, null);
         if (File.Exists(full)) return ("That is a file, not a folder.", null);
         if (Directory.Exists(full))
         {

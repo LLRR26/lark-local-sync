@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using LarkCloud.App.CloudFiles;
 using LarkCloud.Core;
 
 namespace LarkCloud.App.Service;
@@ -69,6 +70,27 @@ public sealed class SyncService : IDisposable
         r?.StopAndCleanUp();
         Config.RemovePair(id);
         StatusChanged?.Invoke();
+    }
+
+    /// <summary>Rename the folder on this PC (same parent). Nothing changes in Lark. Throws if the move fails; the pair then keeps working at the old path.</summary>
+    public void RenamePair(string id, string newLocal)
+    {
+        var p = Config.GetPairs().First(x => x.Id == id);
+        PairRunner? r;
+        lock (_lock) { r = _runners.GetValueOrDefault(id); _runners.Remove(id); }
+        r?.Dispose();
+        try
+        {
+            SyncRoot.Unregister(p);            // Windows won't rename a registered sync root; the new runner registers it again
+            Directory.Move(p.LocalFolder, newLocal);
+            p.LocalFolder = newLocal;
+            Config.Save();
+        }
+        finally
+        {
+            StartRunner(p);
+            StatusChanged?.Invoke();
+        }
     }
 
     public void SetPaused(string id, bool paused)

@@ -90,6 +90,7 @@ internal sealed class PreviewModel : IAppModel
     public void SetDocCopies(string id, bool on) { _pairs.First(p => p.Id == id).DocCopies = on; }
     public void FreeUpSpace(string id) { }
     public void RemoveFolder(string id) { _pairs.RemoveAll(p => p.Id == id); }
+    public void RenameFolder(string id, string newPath) { _pairs.First(p => p.Id == id).LocalFolder = newPath; }
     public void SyncAllNow() { }
     public void AddFolder() { }
     public IFolderSource OpenFolderSource() => new FakeSource();

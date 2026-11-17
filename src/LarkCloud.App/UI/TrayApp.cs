@@ -171,6 +171,7 @@ internal sealed class TrayApp : IAppModel, IDisposable
     public void SetDocCopies(string pairId, bool on) => _svc.SetDocCopies(pairId, on);
     public void FreeUpSpace(string pairId) => _svc.Runner(pairId)?.FreeUpSpaceNow();
     public void RemoveFolder(string pairId) => _svc.RemovePair(pairId);
+    public void RenameFolder(string pairId, string newPath) => _svc.RenamePair(pairId, newPath);
     public void SyncAllNow() => _svc.SyncAllNow();
     void IAppModel.AddFolder() => ShowAddFolder();
     public IFolderSource OpenFolderSource() => new LarkFolderSource(new LarkApi(_svc.Auth, _svc.Http, ""));

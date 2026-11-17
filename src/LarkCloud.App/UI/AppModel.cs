@@ -20,6 +20,7 @@ internal interface IAppModel
     void SetDocCopies(string pairId, bool on);
     void FreeUpSpace(string pairId);
     void RemoveFolder(string pairId);          // slow: call from a background task
+    void RenameFolder(string pairId, string newPath);   // slow, throws if the move fails: call from a background task
     void SyncAllNow();
 
     void AddFolder();

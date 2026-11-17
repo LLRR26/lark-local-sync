@@ -193,6 +193,7 @@ internal sealed partial class FoldersPage : UserControl, IPage
         if (!_m.LockFolders && !p.FromIt)
         {
             menu.Items.Add(new Separator());
+            menu.Items.Add(Item("Rename on this PC…", "", () => Rename(r)));
             menu.Items.Add(Item("Remove from this PC…", "\uE711", () => Remove(r)));
         }
         menu.IsOpen = true;
@@ -217,6 +218,57 @@ internal sealed partial class FoldersPage : UserControl, IPage
             return;
         _m.SetDocCopies(r.Id, on);
         Refresh();
+    }
+
+    static readonly System.Text.RegularExpressions.Regex ReservedName =
+        new(@"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    /// <summary>Plain-language reason the new folder name can't be used, or null. Checked before anything is touched.</summary>
+    string? CheckNewName(FolderRow r, string name, string full)
+    {
+        if (name.Length == 0) return "Type a name for the folder.";
+        if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) return "A folder name can't contain any of these characters: \\ / : * ? \" < > |";
+        if (name.EndsWith('.') || name.EndsWith(' ') || ReservedName.IsMatch(name)) return "Windows doesn't allow that name. Try a different one.";
+        if (Directory.Exists(full) || File.Exists(full)) return $"“{name}” already exists in that location. Choose a different name.";
+        return Ui.CheckPcFolder(full, _m.Settings, r.Id).Error;
+    }
+
+    /// <summary>Renames only the folder on this PC; the Lark folder keeps its name.</summary>
+    void Rename(FolderRow r)
+    {
+        var old = r.Pair.LocalFolder.TrimEnd('\\', '/');
+        var parent = Path.GetDirectoryName(old);
+        if (parent == null) return;
+        var name = Path.GetFileName(old);
+        while (true)
+        {
+            if (ConfirmDialog.AskText(Owner, $"Rename “{r.Name}” on this PC",
+                    "Only the folder on this PC gets the new name. The folder in Lark keeps its name.", "Rename", name) is not { } input) return;
+            name = input.Trim();
+            if (string.Equals(name, Path.GetFileName(old), StringComparison.Ordinal)) return;
+            var full = Path.Combine(parent, name);
+            var err = string.Equals(name, Path.GetFileName(old), StringComparison.OrdinalIgnoreCase)
+                ? "Choose a name that differs by more than upper or lower case." : CheckNewName(r, name, full);
+            if (err == null) { Run(full); return; }
+            ConfirmDialog.Tell(Owner, "Can't use that name", err);
+        }
+
+        void Run(string full)
+        {
+            Mouse.OverrideCursor = Cursors.Wait;
+            Task.Run(() => _m.RenameFolder(r.Id, full)).ContinueWith(t => Dispatcher.BeginInvoke(() =>
+            {
+                Mouse.OverrideCursor = null;
+                Refresh();
+                if (t.IsFaulted)
+                {
+                    Log.Warn($"Rename {old} -> {full} failed: {t.Exception?.GetBaseException().Message}");
+                    ConfirmDialog.Tell(Owner, "Couldn't rename the folder",
+                        "Another program may be using the folder or something in it. Close it and try again. " +
+                        $"Your folder was left as it was, and it keeps syncing.\n\n{t.Exception?.GetBaseException().Message}");
+                }
+            }));
+        }
     }
 
     void Remove(FolderRow r)
