@@ -51,13 +51,14 @@ public sealed class SyncRoot : IDisposable
         var id = IdFor(pair.Id);
         try
         {
+            var name = pair.Label;
             var existing = StorageProviderSyncRootManager.GetCurrentSyncRoots().FirstOrDefault(r => r.Id == id);
-            if (existing != null) return;
+            if (existing != null && existing.DisplayNameResource == name) return;
             var info = new StorageProviderSyncRootInfo
             {
                 Id = id,
                 Path = StorageFolder.GetFolderFromPathAsync(pair.LocalFolder).AsTask().GetAwaiter().GetResult(),
-                DisplayNameResource = $"Lark – {pair.Label}",
+                DisplayNameResource = name,
                 IconResource = Environment.ProcessPath + ",0",
                 HydrationPolicy = StorageProviderHydrationPolicy.Full,
                 HydrationPolicyModifier = StorageProviderHydrationPolicyModifier.AutoDehydrationAllowed,
@@ -69,6 +70,19 @@ public sealed class SyncRoot : IDisposable
                 AllowPinning = true,
                 Context = CryptographicBuffer.ConvertStringToBinary(pair.Id, BinaryStringEncoding.Utf8),
             };
+            if (existing != null)
+            {
+                // Registered under an older display name ("Lark – …"): update it. If Windows ignores the update,
+                // register it again from scratch (runs before the folder is connected, like "Rename on this PC" does).
+                try { StorageProviderSyncRootManager.Register(info); } catch (Exception ex) { Log.Info($"Updating the Explorer name failed: {ex.Message}"); }
+                if (StorageProviderSyncRootManager.GetCurrentSyncRoots().FirstOrDefault(r => r.Id == id)?.DisplayNameResource == name)
+                {
+                    Log.Info($"Renamed “{pair.LocalFolder}” in Explorer to “{name}”");
+                    return;
+                }
+                Unregister(pair);
+                Log.Info($"Registering “{pair.LocalFolder}” again to show it in Explorer as “{name}”");
+            }
             StorageProviderSyncRootManager.Register(info);
             Log.Info($"Registered “{pair.LocalFolder}” with Windows as a Lark cloud folder");
         }
