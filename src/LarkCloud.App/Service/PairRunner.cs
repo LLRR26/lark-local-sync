@@ -56,7 +56,7 @@ public sealed class PairRunner : IDisposable
     volatile bool _stop;
     bool _fullRequested = true, _allowDeletes, _restore, _retryFailed, _freeAll;
     readonly HashSet<string> _changed = new(StringComparer.OrdinalIgnoreCase);
-    DateTime _lastChange = DateTime.MinValue, _nextFull = DateTime.MinValue, _recheckAt = DateTime.MaxValue;
+    DateTime _lastChange = DateTime.MinValue, _nextFull = DateTime.MinValue, _recheckAt = DateTime.MaxValue, _nextFast = DateTime.MinValue;
     readonly ConcurrentQueue<string> _maintQueue = new();
     readonly ConcurrentQueue<string> _hydrateQueue = new();
     DateTime _lastSweep = DateTime.MinValue;
@@ -249,12 +249,24 @@ public sealed class PairRunner : IDisposable
                     // for something that needs the full pass: deletions, restore, retry).
                     var quickFirst = full && _fullPaused && settled && !_allowDeletes && !_restore && !_retryFailed && _engine!.Index.Complete;
                     if (quickFirst) full = false;
-                    if (!full && !settled && now < _recheckAt)
+                    // "Check often" folders: a quick pass over just those, never ahead of a settled PC pass or a full pass.
+                    var fastOn = Pair.CheckOften.Count > 0 && _engine!.Index.Complete;
+                    var fastDue = fastOn && !full && !settled && now >= _nextFast;
+                    if (!full && !settled && now < _recheckAt && !fastDue)
                     {
                         var until = _nextFull;
                         if (_changed.Count > 0) until = Min(until, _lastChange.AddSeconds(_cfg.SettleSeconds));
+                        if (fastOn) until = Min(until, _nextFast);
                         until = Min(until, _recheckAt);
                         wait = until - now;
+                    }
+                    else if (fastDue)
+                    {
+                        // Leaves _changed (still settling) and _recheckAt alone for the pass that owns them.
+                        var fast = FastPaths();
+                        _nextFast = now + FastEvery;
+                        if (fast.Count == 0) wait = FastEvery;            // none of the chosen folders exist (yet)
+                        else changed = fast;
                     }
                     else
                     {
@@ -319,6 +331,19 @@ public sealed class PairRunner : IDisposable
         }
     }
 
+    const int FastCap = 200;                                          // ponytail: folders per fast pass; a bigger chosen tree is cut off, the full pass still covers it
+    static readonly TimeSpan FastEvery = TimeSpan.FromSeconds(30);
+
+    /// <summary>The chosen folders plus every known folder under them, so a quick pass relists all of them.
+    /// Chosen folders that don't exist (any more) are skipped.</summary>
+    List<string> FastPaths()
+    {
+        var chosen = Pair.CheckOften.Select(c => c.Replace('\\', '/').Trim('/')).Where(c => c.Length > 0).ToList();
+        var folders = _state!.All().Where(b => b.Kind == Kinds.Folder).Select(b => b.Path)
+            .Where(p => chosen.Any(c => string.Equals(p, c, StringComparison.OrdinalIgnoreCase) || p.StartsWith(c + "/", StringComparison.OrdinalIgnoreCase)));
+        return folders.OrderBy(PathUtil.Depth).Take(FastCap).ToList();
+    }
+
     bool QuickWorkReady()
     {
         lock (_lock) return _changed.Count > 0 && DateTime.UtcNow - _lastChange >= TimeSpan.FromSeconds(_cfg.SettleSeconds);
@@ -334,7 +359,7 @@ public sealed class PairRunner : IDisposable
             var folders = Math.Max(1, _engine!.Index.FolderCount);
             var interval = TimeSpan.FromSeconds(Math.Clamp(60.0 * Math.Ceiling(folders / 100.0), 60, 900));
             var gap = TimeSpan.FromTicks(Math.Max(interval.Ticks, took.Ticks * 3));
-            lock (_lock) { _nextFull = now + gap; _status.LastFull = now; }
+            lock (_lock) { _nextFull = now + gap; _nextFast = now + FastEvery; _status.LastFull = now; }
         }
         if (_engine!.BusyFilesWaiting) lock (_lock) _recheckAt = now.AddSeconds(_cfg.SettleSeconds + 1);
         if (_engine.ConfirmDeletesSoon) lock (_lock) _nextFull = now.AddSeconds(20);
