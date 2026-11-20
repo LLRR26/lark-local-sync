@@ -23,7 +23,7 @@ Both apps can be installed side by side. They must not use the same PC folder.
   * **Always keep on this device** – download it now and keep it (for working offline).
   * **Free up space** – remove the local copy; it stays listed and downloads again when opened.
 * In the app's Folders list, the ⋯ menu has **Rename on this PC…**: it renames only the folder on the PC (the Lark folder keeps its name) and keeps syncing from the new path. Not shown for folders your IT team manages.
-* The ⋯ menu also has **Check often…**: pick subfolders to look at in Lark about every 30 seconds, so changes made in Lark show up on the PC quickly. The rest of the folder is checked every 1–15 minutes as before. Works for folders your IT team manages too.
+* The ⋯ menu also has **Check often…**: pick subfolders to look at in Lark about every 30 seconds, so new files, edits and renames made in Lark show up on the PC quickly. Deletions (and files moved out of those subfolders) still wait for the normal check, which runs for the whole folder every 1–15 minutes as before; this keeps a short Lark hiccup from ever deleting files on the PC. Works for folders your IT team manages too.
 * A tray icon (blue cloud) with a coloured dot: green = up to date, blue = syncing, amber = something needs a look,
   red = can't sync (for example signed out). Left-click opens what needs attention.
 

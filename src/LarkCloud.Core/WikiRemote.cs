@@ -30,8 +30,10 @@ public sealed class WikiRemote : IRemoteDrive
     {
         if (!IsWiki(folderToken)) return _api.ListFolder(folderToken);       // Drive folders (e.g. My Folders)
         var node = folderToken[FolderPrefix.Length..];
-        var outList = new List<RemoteEntry>();
-        foreach (var n in _api.WikiNodes(_space, node.Length == 0 ? null : node))
+        var outList = new RemoteListing();
+        var nodes = _api.WikiNodes(_space, node.Length == 0 ? null : node);
+        outList.Incomplete = (nodes as WikiNodeList)?.Incomplete == true;
+        foreach (var n in nodes)
         {
             if (n.ObjType == "file")
                 outList.Add(new RemoteEntry { Path = n.Title, Token = n.ObjToken, Type = Kinds.File, MTime = n.EditTime, ParentToken = folderToken });

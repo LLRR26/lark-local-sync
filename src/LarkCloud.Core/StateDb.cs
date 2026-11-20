@@ -63,8 +63,11 @@ public sealed class StateDb : IDisposable
     public void RemoveTree(string path)
     {
         lock (_lock)
+        {
+            if (_all.TryGetValue(path, out var one) && one.Kind != Kinds.Folder) { Remove(path); return; }     // a file: nothing under it
             foreach (var p in _all.Keys.Where(p => p == path || p.StartsWith(path + "/", StringComparison.Ordinal)).ToList())
                 Remove(p);
+        }
     }
 
     /// <summary>After a move/rename: every path under `from` now lives under `to`.</summary>

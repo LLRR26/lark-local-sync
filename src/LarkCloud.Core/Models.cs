@@ -69,12 +69,22 @@ public sealed class BaseEntry
     public string Kind { get; set; } = Kinds.File;
     public string? Token { get; set; }
     public string? RType { get; set; }
-    public string? RMTime { get; set; }              // null = "we just uploaded it; adopt what Lark reports next"
+    public string? RMTime { get; set; }              // "we just uploaded it; adopt what Lark reports next" = null (old databases) or "~" + when we did it (Unix seconds)
     public long Size { get; set; }
     public long LMTime { get; set; }                 // local last-write ticks right after sync
     public string? Url { get; set; }                 // for links
 
     public BaseEntry Clone() => (BaseEntry)MemberwiseClone();
+
+    /// <summary>The "pending" marker for RMTime: "~" can never start a real Lark time.</summary>
+    public static string PendingMark(DateTime utcNow) => "~" + new DateTimeOffset(utcNow.ToUniversalTime()).ToUnixTimeSeconds();
+
+    /// <summary>Lark's date for this item isn't known yet (it was just uploaded or moved by us).</summary>
+    public bool RMTimePending => RMTime == null || RMTime.StartsWith('~');
+
+    /// <summary>When we uploaded/moved it, if the marker says so (null for old databases).</summary>
+    public DateTime? PendingSince => RMTime is { } t && t.StartsWith('~') && long.TryParse(t.AsSpan(1), out var s)
+        ? DateTimeOffset.FromUnixTimeSeconds(s).UtcDateTime : null;
 }
 
 public sealed class PendingDelete
@@ -194,13 +204,13 @@ public static class PathUtil
     }
 
     /// <summary>"Report.xlsx" -> "Report (conflict from PC-NAME 2026-11-06).xlsx"</summary>
-    public static string ConflictName(string rel, string who, DateTime when)
+    public static string ConflictName(string rel, string who, DateTime when, int n = 1)
     {
         var parent = Parent(rel);
         var name = Name(rel);
         var dot = name.LastIndexOf('.');
         var stem = dot > 0 ? name[..dot] : name;
         var ext = dot > 0 ? name[dot..] : "";
-        return Join(parent, $"{stem} (conflict from {who} {when:yyyy-MM-dd HHmm}){ext}");
+        return Join(parent, $"{stem} (conflict from {who} {when:yyyy-MM-dd HHmm}{(n > 1 ? $" #{n}" : "")}){ext}");
     }
 }

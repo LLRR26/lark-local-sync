@@ -27,6 +27,16 @@ public sealed class EngineOptions
     public string Label { get; set; } = "Lark";                  // the synced folder's name, for copies of unsaved changes
     public TimeSpan PermissionCheckEvery { get; set; } = TimeSpan.FromHours(1);
     public CancellationToken Cancellation { get; init; }
+    /// <summary>Files this big count as "large" uploads: only max(1, MaxTransfers/4) of them run at once, so small edits keep flowing.</summary>
+    public long LargeUpload { get; set; } = 64L << 20;
+    /// <summary>After this long a pass starts no new uploads; the rest wait for the next pass (so Lark's changes aren't ignored for hours).</summary>
+    public TimeSpan UploadBudget { get; set; } = TimeSpan.FromMinutes(20);
+    /// <summary>Free bytes on the drive of a folder (the snapshot folder); tests replace it.</summary>
+    public Func<string, long> FreeSpace { get; set; } = dir =>
+    {
+        try { return new DriveInfo(Path.GetPathRoot(Path.GetFullPath(dir))!).AvailableFreeSpace; }
+        catch { return long.MaxValue; }                                  // can't tell: don't block uploads
+    };
 }
 
 /// <summary>
@@ -73,6 +83,7 @@ public sealed class CloudEngine
     Dictionary<string, RemoteEntry> _r = new(StringComparer.OrdinalIgnoreCase);
     Dictionary<string, LocalItem> _l = new(StringComparer.OrdinalIgnoreCase);
     Dictionary<string, BaseEntry> _b = new(StringComparer.OrdinalIgnoreCase);
+    HashSet<string> _incompletePaths = new(StringComparer.OrdinalIgnoreCase);   // folders whose Lark listing left an entry out
     HashSet<string>? _fresh;                                           // targeted pass: folders re-listed
     readonly ConcurrentDictionary<string, string> _newFolders = new(StringComparer.OrdinalIgnoreCase);
     readonly ConcurrentBag<string> _dirtyRemote = new();
@@ -87,6 +98,7 @@ public sealed class CloudEngine
     readonly ConcurrentDictionary<string, byte> _roFolders = new();                                   // Lark folder tokens we can't edit
     bool? _rootEditable;
     DateTime _roCheckedAt = DateTime.MinValue;
+    DateTime _passStart;                                                       // when this pass began (ConfirmUploads tells this pass's uploads from older ones)
     HashSet<string>? _roApplied;                                                                      // files we made read-only
 
     public CloudEngine(IRemoteDrive remote, ICloudLocal local, StateDb state, RemoteIndex index, EngineOptions opt)
@@ -109,9 +121,11 @@ public sealed class CloudEngine
     {
         _opt.Cancellation.ThrowIfCancellationRequested();
         _res = new SyncResult();
+        _passStart = _opt.Now();
         if (!RefreshRemote(changed, shouldYield))
             return new SyncResult { Full = false, Interrupted = true };
         _newFolders.Clear();
+        _newLocal.Clear();
         while (_dirtyRemote.TryTake(out _)) { }
         BusyFilesWaiting = false;
         ConfirmDeletesSoon = false;
@@ -244,6 +258,8 @@ public sealed class CloudEngine
             }
         }
 
+        _incompletePaths = _index.IncompleteFolders().Where(folderPath.ContainsKey).Select(t => folderPath[t]).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
         // ---- PC
         RescanLocal();
         _remoteTokens = new HashSet<string>(_r.Values.Select(e => e.Token));
@@ -269,43 +285,59 @@ public sealed class CloudEngine
         var any = false;
         var byToken = _r.Values.Where(e => !e.IsOnlineDoc).GroupBy(e => e.Token).ToDictionary(g => g.Key, g => g.First());
         var baseByToken = BaseByToken();
-        foreach (var b0 in _b.Values.Where(b => b.Token != null && b.Kind != Kinds.Link).OrderBy(b => PathUtil.Depth(b.Path)).ToList())
+        // Moves that can't be applied yet (their target name is still used by another item that is about to move, or the
+        // target folder isn't on the PC yet) wait; the others go first, and the loop goes on while anything moves.
+        var todo = _b.Values.Where(b => b.Token != null && b.Kind != Kinds.Link).OrderBy(b => PathUtil.Depth(b.Path)).ToList();
+        for (var progress = true; progress && todo.Count > 0;)
         {
-            if (!baseByToken.TryGetValue(b0.Token!, out var b)) continue;      // path may have changed with a parent move
-            if (!byToken.TryGetValue(b.Token!, out var r)) continue;
-            if (string.Equals(r.Path, b.Path, StringComparison.Ordinal)) continue;
-            if (_l.TryGetValue(b.Path, out var li) && li.IsPlaceholder && li.Identity != null && li.Identity != b.Token) continue;
-            if (!LocalExists(b.Path) || (LocalExists(r.Path) && !string.Equals(r.Path, b.Path, StringComparison.OrdinalIgnoreCase))) continue;
-            if (_r.ContainsKey(b.Path) && !string.Equals(r.Path, b.Path, StringComparison.OrdinalIgnoreCase)) continue;   // something new took its place
-            if (!LocalExists(PathUtil.Parent(r.Path))) continue;
-            try
+            progress = false;
+            foreach (var b0 in todo.ToList())
             {
-                _local.Move(b.Path, r.Path);
-                _state.RenameTree(b.Path, r.Path);
-                var moved = _state.Get(r.Path);
-                if (moved is { Kind: Kinds.File, RMTime: not null }
-                    && moved.RMTime != r.MTime && _local.Stat(r.Path) is { OnDisk: true } local
-                    && !LocalChanged(local, moved))
+                if (!baseByToken.TryGetValue(b0.Token!, out var b)) { todo.Remove(b0); continue; }      // path may have changed with a parent move
+                if (!byToken.TryGetValue(b.Token!, out var r)) { todo.Remove(b0); continue; }
+                if (string.Equals(r.Path, b.Path, StringComparison.Ordinal)) { todo.Remove(b0); continue; }
+                if (_l.TryGetValue(b.Path, out var li) && li.IsPlaceholder && li.Identity != null && li.Identity != b.Token) continue;
+                if (!LocalExists(b.Path) || (LocalExists(r.Path) && !string.Equals(r.Path, b.Path, StringComparison.OrdinalIgnoreCase))) continue;
+                // something new took its place (not an item that is itself arriving here from another path)
+                if (_r.TryGetValue(b.Path, out var occ) && !string.Equals(r.Path, b.Path, StringComparison.OrdinalIgnoreCase)
+                    && !(baseByToken.TryGetValue(occ.Token, out var ob) && !string.Equals(ob.Path, b.Path, StringComparison.Ordinal))) continue;
+                if (!LocalExists(PathUtil.Parent(r.Path))) continue;
+                try
                 {
-                    // A rename can change the timestamp. Keep the downloaded data only after checking its content.
-                    try
+                    _local.Move(b.Path, r.Path);
+                    _state.RenameTree(b.Path, r.Path);
+                    var moved = _state.Get(r.Path);
+                    if (moved is { Kind: Kinds.File, RMTimePending: false }
+                        && moved.RMTime != r.MTime && _local.Stat(r.Path) is { OnDisk: true } local)
                     {
-                        if (SameContent(r, local))
+                        // A rename can change the timestamp. Keep the downloaded data only after checking its content.
+                        // Not verified (different size, big file, any error) is always safe: the unchanged PC copy is then
+                        // refreshed from Lark by normal reconciliation.
+                        // A PC copy that was edited can't be compared with Lark's: it stays "changed on both sides" and both
+                        // versions are kept. (Same size isn't proof Lark's content is unchanged, and guessing could lose an edit.)
+                        try
                         {
-                            moved.RMTime = r.MTime;
-                            _state.Put(moved);
+                            if (!LocalChanged(local, moved) && SameContent(r, local, SizeOf(r) ?? _remote.ProbeSize(r.Token), MoveCheckMax))
+                            {
+                                moved.RMTime = r.MTime;
+                                _state.Put(moved);
+                            }
+                        }
+                        catch (Exception ex) when (ex is not NeedLoginException && !_opt.Cancellation.IsCancellationRequested)
+                        {
+                            Log.Info($"{r.Path}: couldn't compare it with Lark after the move ({ex.Message}); it will be refreshed instead");
                         }
                     }
-                    catch (IOException) { } // normal reconciliation will handle the unverified change
-                    catch (LarkApiException) { }
+                    Log.Info($"Moved here (moved in Lark): {b.Path} → {r.Path}");
+                    _res.Moved++;
+                    any = true;
+                    progress = true;
+                    todo.Remove(b0);
+                    MovedLocal(b.Path, r.Path);
+                    baseByToken = BaseByToken();
                 }
-                Log.Info($"Moved here (moved in Lark): {b.Path} → {r.Path}");
-                _res.Moved++;
-                any = true;
-                RescanLocal();
-                baseByToken = BaseByToken();
+                catch (Exception ex) { todo.Remove(b0); Fail(b.Path, ex, $"move “{b.Path}” to match Lark", "move" + r.Path); }
             }
-            catch (Exception ex) { Fail(b.Path, ex, $"move “{b.Path}” to match Lark", "move" + r.Path); }
         }
         return any;
     }
@@ -329,50 +361,85 @@ public sealed class CloudEngine
             foreach (var g in fresh.GroupBy(l => (l.Size, l.MTime)).Where(g => g.Count() == 1))
                 if (vanished.TryGetValue(g.Key, out var gone)) candidates.Add((g.First(), gone.Token!));
         }
-        foreach (var (li, token) in candidates.OrderBy(c => PathUtil.Depth(c.L.Path)).ToList())
+        // A rename chain (a -> c, then b -> a) must go in the order that frees names first: a move whose target name is
+        // still taken in Lark by another item waits until that item has moved. What is still waiting when nothing else
+        // moves is done anyway.
+        var todo = candidates.OrderBy(c => PathUtil.Depth(c.L.Path)).ToList();
+        for (var force = false; todo.Count > 0;)
         {
-            if (!baseByToken.TryGetValue(token, out var b) || b.Kind == Kinds.Link) continue;
-            if (Unknown(b.Path)) continue;
-            if (string.Equals(b.Path, li.Path, StringComparison.Ordinal)) continue;
-            if (LocalExists(b.Path) && !string.Equals(b.Path, li.Path, StringComparison.OrdinalIgnoreCase)) continue;  // a copy, not a move
-            var r = _r.Values.FirstOrDefault(e => e.Token == b.Token);
-            if (r == null || !string.Equals(r.Path, b.Path, StringComparison.Ordinal)) continue;           // changed in Lark too: let phase C decide
-            var type = b.Kind == Kinds.Folder ? "folder" : (b.RType ?? "file");
-            try
+            var progress = false;
+            foreach (var cand in todo.ToList())
             {
-                var oldParent = PathUtil.Parent(b.Path);
-                var newParent = PathUtil.Parent(li.Path);
-                if (!string.Equals(oldParent, newParent, StringComparison.OrdinalIgnoreCase))
+                var (li, token) = cand;
+                if (!baseByToken.TryGetValue(token, out var b) || b.Kind == Kinds.Link) { todo.Remove(cand); continue; }
+                if (Unknown(b.Path)) { todo.Remove(cand); continue; }
+                if (string.Equals(b.Path, li.Path, StringComparison.Ordinal)) { todo.Remove(cand); continue; }
+                // a copy, not a move: the original is still there (a different item under the old name means it was moved away)
+                if (_l.TryGetValue(b.Path, out var orig) && !string.Equals(b.Path, li.Path, StringComparison.OrdinalIgnoreCase)
+                    && orig.Identity == token) { todo.Remove(cand); continue; }
+                var r = _r.Values.FirstOrDefault(e => e.Token == b.Token);
+                if (r == null) { todo.Remove(cand); continue; }
+                // Lark edited it AND the renamed PC copy was edited: a conflict being kept (e.g. stopped half-way), not a move.
+                // Moving it in Lark would put the PC's edit over Lark's: Decide() brings Lark's version down and uploads this one as new.
+                if (b.Kind == Kinds.File && !string.Equals(r.Path, li.Path, StringComparison.OrdinalIgnoreCase) && RemoteChanged(r, b) && LocalChanged(li, b) && !(li.IsPlaceholder && !li.OnDisk)) { todo.Remove(cand); continue; }
+                if (!force && _r.TryGetValue(li.Path, out var taken) && taken.Token != b.Token) continue;                        // the name is still in use
+                todo.Remove(cand);
+                progress = true;
+                var type = b.Kind == Kinds.Folder ? "folder" : (b.RType ?? "file");
+                try
                 {
-                    var dest = EnsureRemoteFolder(newParent);
-                    _remote.Move(b.Token!, type, dest);
+                    // (moved in Lark as well: the item is where Lark has it now, r.Path, and the PC's move wins)
+                    var oldParent = PathUtil.Parent(r.Path);
+                    var newParent = PathUtil.Parent(li.Path);
+                    if (b.Kind == Kinds.Folder && LandsInsideItself(r, newParent))
+                    {
+                        // Lark moved a folder into this one while the PC moved this one into that one: Lark can't do both.
+                        // Lark's move stands (MoveLikeLark follows it next pass); this PC move is undone.
+                        _local.Move(li.Path, b.Path);
+                        MovedLocal(li.Path, b.Path);
+                        Log.Info($"Undid a move on this PC (Lark moved a folder into it meanwhile): {li.Path} → {b.Path}");
+                        _res.Moved++;
+                        any = true;
+                        continue;
+                    }
+                    ReviveDeletedFolders(newParent);
+                    if (!string.Equals(oldParent, newParent, StringComparison.OrdinalIgnoreCase))
+                    {
+                        var dest = EnsureRemoteFolder(newParent);
+                        _remote.Move(b.Token!, type, dest);
+                    }
+                    if (!string.Equals(PathUtil.Name(r.Path), PathUtil.Name(li.Path), StringComparison.Ordinal))
+                        _remote.Rename(b.Token!, type, PathUtil.Name(li.Path));
+                    var editedInLark = !b.RMTimePending && b.Kind == Kinds.File && r.MTime != b.RMTime;   // Lark's date changed before our move: someone edited it there
+                    _state.RenameTree(b.Path, li.Path);
+                    var mb = _state.Get(li.Path);
+                    // adopt Lark's new date for it on the next listing (unless it's much newer: someone else edited it).
+                    // An edit made in Lark before this move must stay visible: keep the old date, so the next pass sees the change.
+                    if (mb != null && !editedInLark) { mb.RMTime = BaseEntry.PendingMark(_opt.Now()); _state.Put(mb); }
+                    relist.Add(FolderTokenOrRoot(oldParent));
+                    relist.Add(FolderTokenOrRoot(newParent));
+                    var from = r.Path;
+                    foreach (var e in _r.Values.Where(e => e.Path == from || PathUtil.IsUnder(e.Path, from)).ToList())
+                    {
+                        _r.Remove(e.Path);
+                        e.Path = li.Path + e.Path[from.Length..];
+                        _r[e.Path] = e;
+                    }
+                    _dirtyRemote.Add(_r.TryGetValue(li.Path, out var moved) && moved.ParentToken != null ? moved.ParentToken : _remote.RootToken);
+                    Log.Info($"Moved in Lark (moved on this PC): {b.Path} → {li.Path}");
+                    _res.Moved++;
+                    any = true;
+                    baseByToken = BaseByToken();
                 }
-                if (!string.Equals(PathUtil.Name(b.Path), PathUtil.Name(li.Path), StringComparison.Ordinal))
-                    _remote.Rename(b.Token!, type, PathUtil.Name(li.Path));
-                _state.RenameTree(b.Path, li.Path);
-                var mb = _state.Get(li.Path);
-                if (mb != null) { mb.RMTime = null; _state.Put(mb); }   // adopt Lark's new date for it on the next listing
-                relist.Add(FolderTokenOrRoot(oldParent));
-                relist.Add(FolderTokenOrRoot(newParent));
-                foreach (var e in _r.Values.Where(e => e.Path == b.Path || PathUtil.IsUnder(e.Path, b.Path)).ToList())
-                {
-                    _r.Remove(e.Path);
-                    e.Path = li.Path + e.Path[b.Path.Length..];
-                    _r[e.Path] = e;
-                }
-                _dirtyRemote.Add(_r.TryGetValue(li.Path, out var moved) && moved.ParentToken != null ? moved.ParentToken : _remote.RootToken);
-                Log.Info($"Moved in Lark (moved on this PC): {b.Path} → {li.Path}");
-                _res.Moved++;
-                any = true;
-                baseByToken = BaseByToken();
+                catch (Exception ex) { Fail(li.Path, ex, $"move “{PathUtil.Name(li.Path)}” in Lark", "move" + b.Path); }
             }
-            catch (Exception ex) { Fail(li.Path, ex, $"move “{PathUtil.Name(li.Path)}” in Lark", "move" + b.Path); }
+            if (!progress) { if (force) break; force = true; }
         }
         any |= MoveShortcutsLikePc(relist);
         if (any)
         {
             try { _index.Refresh(relist); }
-            catch (Exception ex) { Log.Warn($"Couldn't re-check Lark after moving ({ex.Message})"); _index.Invalidate(); }
+            catch (Exception ex) { Log.Warn($"Couldn't re-check Lark after moving ({ex.Message})"); _index.Invalidate(); throw; }   // end the pass: carrying on would read the stale index and see the moved item as deleted in Lark
         }
         return any;
     }
@@ -383,7 +450,7 @@ public sealed class CloudEngine
         var any = false;
         var byUrl = new Dictionary<string, BaseEntry>(StringComparer.Ordinal);
         foreach (var b in _state.All())
-            if (b.Kind == Kinds.Link && b.Url != null) byUrl.TryAdd(b.Url, b);
+            if (b.Kind == Kinds.Link && LinkUrl(b.Url, b.RType, b.Token) is { } u) byUrl.TryAdd(u, b);
         if (byUrl.Count == 0) return false;
         foreach (var li in _l.Values.Where(l => !l.IsDir && !l.IsPlaceholder && l.Size < 8192 && !_b.ContainsKey(l.Path)
                                                  && l.Path.EndsWith(".url", StringComparison.OrdinalIgnoreCase)).ToList())
@@ -397,6 +464,7 @@ public sealed class CloudEngine
                 var oldParent = PathUtil.Parent(b.Path);
                 var newParent = PathUtil.Parent(li.Path);
                 var type = b.RType ?? "docx";
+                ReviveDeletedFolders(newParent);
                 if (!string.Equals(oldParent, newParent, StringComparison.OrdinalIgnoreCase))
                     _remote.Move(b.Token!, type, EnsureRemoteFolder(newParent));
                 string Bare(string p) => PathUtil.Name(p)[..^4];
@@ -406,7 +474,7 @@ public sealed class CloudEngine
                 b.Path = li.Path;
                 b.Size = li.Size;
                 b.LMTime = li.MTime;
-                b.RMTime = null;
+                b.RMTime = BaseEntry.PendingMark(_opt.Now());
                 _state.Put(b);
                 _r.Remove(r.Path);
                 r.Path = li.Path;
@@ -435,6 +503,36 @@ public sealed class CloudEngine
         return null;
     }
 
+    /// <summary>Would moving this Lark folder into `newParent` (a PC path) put it inside itself, going by where Lark has things now?</summary>
+    bool LandsInsideItself(RemoteEntry folder, string newParent)
+    {
+        string? tok = null;
+        for (var q = newParent; tok == null; q = PathUtil.Parent(q))
+        {
+            try { tok = FolderToken(q); } catch (InvalidOperationException) { }
+        }
+        var byTok = _r.Values.GroupBy(e => e.Token).ToDictionary(g => g.Key, g => g.First());
+        for (var n = 0; tok != null && tok != _remote.RootToken && n < 1000; n++)
+        {
+            if (tok == folder.Token) return true;
+            tok = byTok.GetValueOrDefault(tok)?.ParentToken;
+        }
+        return false;
+    }
+
+    /// <summary>Something is moved on the PC into a folder (chain) Lark has deleted: the folders on the way are made again in
+    /// Lark (the moved item is not deleted with them; whatever else was in them stays deleted).</summary>
+    void ReviveDeletedFolders(string folder)
+    {
+        for (var q = folder; q.Length > 0; q = PathUtil.Parent(q))
+            if (_b.TryGetValue(q, out var bq) && bq.Kind == Kinds.Folder && bq.Token != null && !_r.ContainsKey(q) && !_newFolders.ContainsKey(q)
+                && !_remoteTokens.Contains(bq.Token) && KnownMissingInLark(q))
+            {
+                _state.Remove(q);
+                _b.Remove(q);
+            }
+    }
+
     string FolderTokenOrRoot(string rel)
     {
         try { return FolderToken(rel); } catch (InvalidOperationException) { return _remote.RootToken; }
@@ -450,6 +548,16 @@ public sealed class CloudEngine
 
     bool LocalExists(string rel) => rel.Length == 0 || _l.ContainsKey(rel);
 
+    /// <summary>The PC list follows a move without scanning the whole folder again (a scan per rename is far too slow at 50k files).</summary>
+    void MovedLocal(string from, string to)
+    {
+        foreach (var k in _l.Keys.Where(k => k.Equals(from, StringComparison.OrdinalIgnoreCase) || Under(k, from)).ToList())
+        {
+            _l.Remove(k);
+            if (_local.Stat(to + k[from.Length..]) is { } i && !_opt.Ignore.IsIgnored(i.Path)) _l[i.Path] = i;
+        }
+    }
+
     void RescanLocal()
     {
         _l = new(StringComparer.OrdinalIgnoreCase);
@@ -462,15 +570,27 @@ public sealed class CloudEngine
     sealed record Upload(string Path, string? Existing, bool Conflict = false);
 
     /// <summary>Only a full pass (Lark listed completely) acts on things missing from Lark: in a quick
-    /// pass an item may just have moved to a folder that wasn't re-listed.</summary>
-    bool KnownMissingInLark(string path) => _fresh == null;
+    /// pass an item may just have moved to a folder that wasn't re-listed. Nor does anything under a folder whose
+    /// listing had to skip an entry: the skipped item is unknown, not deleted.</summary>
+    bool KnownMissingInLark(string path) => _fresh == null && !UnderIncomplete(path);
+
+    static bool Under(string rel, string folder) => folder.Length == 0 || rel.StartsWith(folder + "/", StringComparison.OrdinalIgnoreCase);
+
+    bool UnderIncomplete(string path) => _incompletePaths.Any(f => Under(path, f));
+
+    /// <summary>This folder, or one inside it, has Lark items we couldn't list: deleting it in Lark would take them along.</summary>
+    bool HasIncomplete(string folder) => _incompletePaths.Any(f => Under(folder, f) || f.Equals(folder, StringComparison.OrdinalIgnoreCase) || Under(f, folder));
 
     static bool LocalChanged(LocalItem l, BaseEntry b) =>
         b.LMTime == BaseEntry.LocalUploadPending || (l.IsPlaceholder && !l.InSync) || l.Size != b.Size || l.MTime != b.LMTime ||
         (l.IsPlaceholder && l.Identity != null && b.Token != null && l.Identity != b.Token);
 
+    /// <summary>How far past our own upload/move a Lark date may be and still count as ours (clocks differ a little).</summary>
+    static readonly TimeSpan PendingSlack = TimeSpan.FromMinutes(2);
+
     static bool RemoteChanged(RemoteEntry r, BaseEntry b) =>
-        r.Token != b.Token || (b.RMTime != null && r.MTime != b.RMTime);
+        r.Token != b.Token || (b.PendingSince is { } since ? r.MTimeUtc > since + PendingSlack
+                               : !b.RMTimePending && r.MTime != b.RMTime);
 
     void Decide(string? approvedDeletes)
     {
@@ -497,6 +617,8 @@ public sealed class CloudEngine
             return false;
         }
 
+        var baseByToken = BaseByToken();
+        _rTok = _r.Values.GroupBy(e => e.Token).ToDictionary(g => g.Key, g => g.First());
         var keep = new HashSet<string>(StringComparer.OrdinalIgnoreCase);         // folders that wait for a busy file inside
         var paths = new HashSet<string>(_r.Keys, StringComparer.OrdinalIgnoreCase);
         paths.UnionWith(_l.Keys);
@@ -573,6 +695,7 @@ public sealed class CloudEngine
                 }
                 else if (rFolder && L == null)
                 {
+                    if (B == null && MovedInLarkNotYetHere(R!, baseByToken)) continue;   // moved in Lark; the PC folder follows next pass
                     if (B == null || B.Token == null) localFolders.Add(R!);
                     else if (B.Token != R!.Token)
                     {
@@ -581,15 +704,20 @@ public sealed class CloudEngine
                         replacedFolders.Add(p);
                         BusyFilesWaiting = true;
                     }
-                    else if (_opt.DeleteWins || FolderDeletableInLark(p)) { deleteInLark.Add(B); goneHere.Add(p); }
+                    else if (!HasIncomplete(p) && (_opt.DeleteWins || FolderDeletableInLark(p))) { deleteInLark.Add(B); goneHere.Add(p); }
                     else localFolders.Add(R!);                            // something new/changed inside in Lark: keep it
                 }
                 else if (lFolder && R == null)
                 {
-                    if (B == null && L!.IsPlaceholder && L.Identity != null && KnownMissingInLark(p) && !_remoteTokens.Contains(L.Identity))
+                    if (B == null && L!.IsPlaceholder && L.Identity != null && KnownMissingInLark(p) && !_remoteTokens.Contains(L.Identity) && !_putBack.Contains(p))
                     { deleteHere.Add(p); goneInLark.Add(p); }                 // came from Lark (has a Lark ID) and is gone there: deleted in Lark
                     else if (B == null) remoteFolders.Add(p);
-                    else if (KnownMissingInLark(p)) { deleteHere.Add(p); goneInLark.Add(p); }
+                    else if (KnownMissingInLark(p))
+                    {
+                        if (B.Token != null && L!.Identity == B.Token && MoveCanFollow(B.Token)) continue;   // moved in Lark, not deleted: follows next pass
+                        if ((!_opt.DeleteWins || (B.Token != null && _remoteTokens.Contains(B.Token))) && EditedInside(p)) { _state.Remove(p); remoteFolders.Add(p); }   // an edit wins: the folder comes back, and each file inside is judged by itself
+                        else { deleteHere.Add(p); goneInLark.Add(p); }
+                    }
                 }
                 else if (B != null && L == null && R == null && KnownMissingInLark(p))
                     _state.Remove(p);
@@ -599,8 +727,9 @@ public sealed class CloudEngine
             // ---------------- files
             if (R != null && L == null)
             {
+                if (B == null && MovedInLarkNotYetHere(R, baseByToken)) continue;   // moved in Lark; the PC copy follows next pass (don't download a second one)
                 if (B == null) placeholders.Add((R, false));
-                else if (R.Token != B.Token || (!_opt.DeleteWins && RemoteChanged(R, B))) { _state.Remove(p); placeholders.Add((R, false)); }   // a different Lark item now (or edited, with delete_wins off): bring it down
+                else if (R.Token != B.Token || ((!_opt.DeleteWins || EditedElsewhere(p, B)) && RemoteChanged(R, B))) { _state.Remove(p); placeholders.Add((R, false)); }   // a different Lark item now (or edited, with delete_wins off): bring it down
                 else deleteInLark.Add(B);                                 // (an edited version stays in Lark's trash)
             }
             else if (R == null && L != null)
@@ -615,10 +744,31 @@ public sealed class CloudEngine
                         deleteHere.Add(p);
                         continue;
                     }
+                    // A cloud-only placeholder of an item Lark still has under another name (e.g. the "name (2)" shown for a duplicate
+                    // name that has become unique) holds no PC data: never upload it as new; the item shows up under its real name.
+                    if (L.IsPlaceholder && !L.OnDisk && L.Identity != null && !SpecialTokens.IsCopy(L.Identity) && _remoteTokens.Contains(L.Identity))
+                    {
+                        deleteHere.Add(p);
+                        continue;
+                    }
                     if (Busy(L, now)) continue;
+                    if (IsShortcutOfGoneDoc(L)) { deleteHere.Add(p); continue; }   // a moved shortcut of a doc deleted in Lark: not a file to upload
                     uploads.Add(new Upload(p, null));
                 }
                 else if (!KnownMissingInLark(p)) continue;
+                else if (B.Token != null && _remoteTokens.Contains(B.Token) && (MoveCanFollow(B.Token) || !(L.IsPlaceholder && L.Identity == B.Token) || (LocalChanged(L, B) && !(L.IsPlaceholder && !L.OnDisk))))
+                {
+                    // Not deleted: Lark moved or renamed it and the PC couldn't follow yet (see MoveLikeLark).
+                    if (L.IsPlaceholder && L.Identity == B.Token && MoveCanFollow(B.Token)
+                        && !(LocalChanged(L, B) && !(L.IsPlaceholder && !L.OnDisk) && UnderAny(_rTok[B.Token].Path, goneHere))) continue;   // the PC copy follows next pass (not into a folder this PC deleted: it is deleted in Lark now, so an edit is kept as a new file)
+                    _state.Remove(p);                                     // what is here now is a different, new file that took the old name
+                    if (!Busy(L, now)) uploads.Add(new Upload(p, null));
+                }
+                else if (!L.IsPlaceholder && B.Token != null && _l.Values.Any(o => o.Identity == B.Token && !string.Equals(o.Path, p, StringComparison.OrdinalIgnoreCase)))
+                {
+                    _state.Remove(p);                                     // the old file was moved away on the PC: this is a new, unlinked file that took its name
+                    if (!Busy(L, now)) uploads.Add(new Upload(p, null));
+                }
                 else if (_opt.DeleteWins && LocalChanged(L, B) && Busy(L, now)) continue;   // still being written: wait until it settles
                 else if (!LocalChanged(L, B) || (L.IsPlaceholder && !L.OnDisk) || _opt.DeleteWins) deleteHere.Add(p);   // edited here: to the Recycle Bin
                 else
@@ -650,11 +800,14 @@ public sealed class CloudEngine
                     placeholders.Add((R, true));
                     continue;
                 }
-                if (lc && rc) conflicts.Add((R, L));
+                // A cloud-only placeholder of this very item holds no PC data: it can't be an edit, so Lark's version just refreshes it
+                // (e.g. we were stopped right after refreshing it, before the state was written).
+                if (lc && rc && L.IsPlaceholder && !L.OnDisk && L.Identity == R.Token) placeholders.Add((R, true));
+                else if (lc && rc) conflicts.Add((R, L));
                 else if (rc) placeholders.Add((R, true));
                 else if (lc) uploads.Add(new Upload(p, B.Token));
-                else if (B.RMTime == null)
-                {
+                else if (B.RMTimePending)
+                {                                                          // (only when Lark's date isn't much newer than our upload, see RemoteChanged)
                     B.RMTime = R.MTime;                                    // our upload, now confirmed by Lark
                     _state.Put(B);
                 }
@@ -720,17 +873,25 @@ public sealed class CloudEngine
         {
             var affectedFolders = deleteInLark.Where(b => b.Kind == Kinds.Folder)
                 .Select(b => SpecialTokens.Raw(b.Token!)).ToHashSet();
-            var affectedRemote = _index.Entries().GroupBy(e => e.Token)
-                .ToDictionary(g => g.Key, g => g.First());
+            // Which Lark items sit inside a folder being deleted: each token is resolved once (memoised along its
+            // parent chain), so this is linear however big the drive is. Without folders there is nothing to look at.
+            var affectedRemote = affectedFolders.Count == 0 ? new Dictionary<string, RemoteEntry>()
+                : _index.Entries().GroupBy(e => e.Token).ToDictionary(g => g.Key, g => g.First());
+            var inside = new Dictionary<string, bool>();
             bool Affected(RemoteEntry entry)
             {
-                var visited = new HashSet<string>();
-                for (var token = entry.Token; token != null && visited.Add(token);)
+                var chain = new List<string>();
+                var verdict = false;
+                for (var token = entry.Token; token != null;)
                 {
-                    if (affectedFolders.Contains(token)) return true;
+                    if (inside.TryGetValue(token, out verdict)) break;
+                    if (affectedFolders.Contains(token)) { verdict = true; chain.Add(token); break; }
+                    if (chain.Contains(token)) break;                                  // a loop in Lark's data: not inside anything
+                    chain.Add(token);
                     token = affectedRemote.GetValueOrDefault(token)?.ParentToken;
                 }
-                return false;
+                foreach (var t in chain) inside[t] = verdict;
+                return verdict;
             }
             var rows = deleteHere.Select(p => new PendingDelete { Path = p, InLark = false })
                 .Concat(deleteInLark.Select(b => new PendingDelete { Path = b.Path, InLark = true })).ToList();
@@ -782,11 +943,53 @@ public sealed class CloudEngine
         foreach (var r in links) WriteLink(r);
         CreateRemoteFolders(remoteFolders);
         foreach (var (r, l) in bothNew) BothNew(r, l, uploads);
-        foreach (var (r, l) in conflicts) Conflict(r, l, uploads);
-        RunUploads(uploads);
+        foreach (var (r, l) in conflicts) { if (!SameAsLark(r, l)) Conflict(r, l, uploads); }
+        // Quick work first: deletions apply to paths no upload touches, so a long upload batch never holds them back.
         DeleteHere(deleteHere);
         DeleteInLark(deleteInLark, reviewedEntries);
+        RunUploads(uploads);
     }
+
+    /// <summary>Lark has moved/renamed this item and nothing on the PC blocks following: the place it goes to is free, or is held
+    /// by another Lark item that is moving away itself (a rename chain).</summary>
+    Dictionary<string, RemoteEntry> _rTok = new();                  // this pass's Lark items by ID
+    bool MoveCanFollow(string token)
+    {
+        if (!_rTok.TryGetValue(token, out var r) || r.IsOnlineDoc) return false;
+        if (!_l.TryGetValue(r.Path, out var o)) return true;
+        return o.IsPlaceholder && o.Identity != null && o.Identity != token
+            && _rTok.TryGetValue(o.Identity, out var other) && !string.Equals(other.Path, r.Path, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>This Lark item is one the PC already has under another name (moved or renamed in Lark) and MoveLikeLark
+    /// will move it when its target folder exists / its name is free.</summary>
+    bool MovedInLarkNotYetHere(RemoteEntry r, Dictionary<string, BaseEntry> baseByToken) =>
+        !r.IsOnlineDoc && baseByToken.TryGetValue(r.Token, out var bt) && bt.Kind != Kinds.Link
+        && !_r.ContainsKey(bt.Path) && _l.TryGetValue(bt.Path, out var old) && old.Identity == r.Token;
+
+    /// <summary>A new small .url file on the PC that points at a doc we had a shortcut for, and that doc is now gone from Lark
+    /// (the shortcut was moved on the PC while Lark deleted the doc).</summary>
+    bool IsShortcutOfGoneDoc(LocalItem l)
+    {
+        if (l.IsDir || l.IsPlaceholder || l.Size >= 8192 || !l.Path.EndsWith(".url", StringComparison.OrdinalIgnoreCase)) return false;
+        if (!_b.Values.Any(b => b.Kind == Kinds.Link)) return false;
+        var url = ReadShortcut(l.Path);
+        if (url == null) return false;
+        var b = _b.Values.FirstOrDefault(b => b.Kind == Kinds.Link && b.Token != null && LinkUrl(b.Url, b.RType, b.Token) == url);
+        return b != null && !_remoteTokens.Contains(b.Token!) && KnownMissingInLark(b.Path);
+    }
+
+    /// <summary>The PC copy of this file was renamed/moved away and edited (a conflict copy), while Lark has a newer version under the old name.</summary>
+    bool EditedElsewhere(string p, BaseEntry b) =>
+        b.Kind == Kinds.File && _l.Values.Any(l => !l.IsDir && l.Identity == b.Token && !string.Equals(l.Path, p, StringComparison.OrdinalIgnoreCase)
+                                                   && LocalChanged(l, b) && !(l.IsPlaceholder && !l.OnDisk));
+
+    /// <summary>A file at or under this folder was added or edited on the PC since the last sync (a cloud-only
+    /// placeholder never is).</summary>
+    bool EditedInside(string folder) =>
+        _l.Values.Any(l => !l.IsDir && PathUtil.IsUnder(l.Path, folder)
+                           && (_b.TryGetValue(l.Path, out var b) ? LocalChanged(l, b) && !(l.IsPlaceholder && !l.OnDisk)
+                                                                  : !(l.IsPlaceholder && l.Identity != null)));
 
     /// <summary>A folder deleted on the PC is deleted in Lark only if nothing inside it changed in Lark since.</summary>
     bool FolderDeletableInLark(string folder)
@@ -837,8 +1040,8 @@ public sealed class CloudEngine
     {
         // Lark unreachable (network, DNS, Lark busy) isn't a problem with this file: stop this check and let
         // the whole thing be tried again shortly, instead of putting the file on a 30-minute wait.
-        if (ex is LarkUnreachableException or HttpRequestException or NeedLoginException) throw ex;
-        if (ex is LarkApiException { Code: 429 } busy) throw new LarkUnreachableException(busy.Message, busy);
+        if (ex is LarkUnreachableException or HttpRequestException or NeedLoginException) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(ex);   // keeps the original stack trace
+        if (ex is LarkApiException { Code: 429 or 99991400 } busy) throw new LarkUnreachableException(busy.Message, busy);   // 99991400 = Lark's "too many requests"
         _r.TryGetValue(path, out var r);
         _l.TryGetValue(path, out var l);
         string? msg = plain;
@@ -886,7 +1089,7 @@ public sealed class CloudEngine
             Log.Error($"{path}: {msg}");
         }
         else Log.Info($"{path}: {ex?.Message}");
-        if (ex is NeedLoginException) throw ex;
+        if (ex is NeedLoginException) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(ex);   // keeps the original stack trace
     }
 
     string? LarkFolderUrl(string rel)
@@ -997,9 +1200,13 @@ public sealed class CloudEngine
         }
     }
 
+    /// <summary>The address a shortcut points to. B keeps Lark's own url (may be null), so rebuild it the same way here.</summary>
+    string? LinkUrl(string? url, string? type, string? token) =>
+        url ?? (_opt.TenantHost != null && token != null ? $"https://{_opt.TenantHost}/{type}/{token}" : null);
+
     void WriteLink(RemoteEntry r)
     {
-        var url = r.Url ?? (_opt.TenantHost != null ? $"https://{_opt.TenantHost}/{r.Type}/{r.Token}" : null);
+        var url = LinkUrl(r.Url, r.Type, r.Token);
         if (url == null) return;
         try
         {
@@ -1057,6 +1264,7 @@ public sealed class CloudEngine
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
         _state.Put(b);
+        lock (_resLock) _putBack.Remove(rel);                              // "put back" done: it's in Lark again
         Log.Info($"Created folder in Lark: {rel}");
         return tok;
     }
@@ -1090,7 +1298,7 @@ public sealed class CloudEngine
         try
         {
             var size = SizeOf(r) ?? _remote.ProbeSize(r.Token);
-            if (size == l.Size && SameContent(r, l))
+            if (SameContent(r, l, size))
             {
                 Relink(r.Path, r.Token);
                 var b = _state.Get(r.Path);
@@ -1104,11 +1312,39 @@ public sealed class CloudEngine
         catch (Exception ex) { Fail(r.Path, ex, "compare this file with the one in Lark"); }
     }
 
-    bool SameContent(RemoteEntry r, LocalItem l)
+    const long MoveCheckMax = 16L << 20;          // after a move in Lark, bigger files are refreshed instead of downloaded to compare
+
+    /// <summary>Same bytes here and in Lark? Different sizes answer "no" without downloading anything; so does a file
+    /// above `maxBytes` (callers treat "no" as the safe outcome).</summary>
+    bool SameContent(RemoteEntry r, LocalItem l, long remoteSize, long maxBytes = long.MaxValue)
     {
-        using var a = _remote.OpenRead(r.Token, 0, CancellationToken.None);
+        if (remoteSize != l.Size || remoteSize > maxBytes) return false;
+        using var a = _remote.OpenRead(r.Token, 0, _opt.Cancellation);
         using var b = _local.OpenForUpload(l.Path);
         return SHA256.HashData(a).AsSpan().SequenceEqual(SHA256.HashData(b));
+    }
+
+    /// <summary>"Changed on both sides" but the bytes are identical (e.g. we uploaded an edit and stopped before recording it):
+    /// just record it as synced. Only a real content comparison counts; a different size, a file over the cap, an
+    /// offline placeholder or a file that changes while it is compared is "no" (both versions are kept).</summary>
+    bool SameAsLark(RemoteEntry r, LocalItem l)
+    {
+        try
+        {
+            if (l.IsPlaceholder && !l.OnDisk) return false;
+            if (!SameContent(r, l, SizeOf(r) ?? _remote.ProbeSize(r.Token), MoveCheckMax)) return false;
+            if (_local.Stat(l.Path) is not { } now || now.Size != l.Size || now.MTime != l.MTime) return false;
+            Relink(r.Path, r.Token);
+            var b = _state.Get(r.Path);
+            if (b != null) { b.RMTime = r.MTime; _state.Put(b); }
+            Log.Info($"Matched up (same content here and in Lark): {r.Path}");
+            return true;
+        }
+        catch (Exception ex) when (ex is not NeedLoginException && !_opt.Cancellation.IsCancellationRequested)
+        {
+            Log.Info($"{r.Path}: couldn't compare it with Lark ({ex.Message}); keeping both versions");
+            return false;
+        }
     }
 
     /// <summary>Changed on both sides: keep both. The PC version is renamed and uploaded as a new file;
@@ -1117,7 +1353,10 @@ public sealed class CloudEngine
     {
         try
         {
-            var copy = PathUtil.ConflictName(r.Path, _opt.MachineName, DateTime.Now);
+            var now = DateTime.Now;
+            var copy = PathUtil.ConflictName(r.Path, _opt.MachineName, now);
+            for (var n = 2; _local.Stat(copy) != null || _r.ContainsKey(copy); n++)          // a second conflict within the same minute
+                copy = PathUtil.ConflictName(r.Path, _opt.MachineName, now, n);
             _local.Move(r.Path, copy);
             _state.Remove(r.Path);
             _res.Conflicts.Add(r.Path);
@@ -1137,18 +1376,54 @@ public sealed class CloudEngine
         catch (Exception ex) { Fail(r.Path, ex, "keep both versions of this file"); }
     }
 
+    const long SnapshotMargin = 256L << 20;                            // kept free on the drive on top of the snapshots
+    long _snapReserved;                                                // bytes of snapshots being written right now
+    bool _snapsCleaned;
+
+    /// <summary>Small files first and at most max(1, MaxTransfers/4) large ones at a time, so a few multi-GB files can't
+    /// keep every slot while hundreds of small edits wait. Total never exceeds MaxTransfers. Stops starting new uploads
+    /// after UploadBudget (they're simply still "changed" at the next pass).</summary>
     void RunUploads(List<Upload> uploads)
     {
         if (uploads.Count == 0) return;
-        var done = 0;
-        Parallel.ForEach(uploads, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, _opt.MaxTransfers) }, u =>
+        if (!_snapsCleaned) { _snapsCleaned = true; try { _local.CleanSnapshots(); } catch (Exception ex) { Log.Info($"Couldn't clean old upload copies: {ex.Message}"); } }
+        var sized = uploads.Select(u => (U: u, Size: _l.TryGetValue(u.Path, out var li) ? li.Size : 0L)).OrderBy(x => x.Size).ToList();
+        var small = new Queue<Upload>(sized.Where(x => x.Size < _opt.LargeUpload).Select(x => x.U));
+        var large = new Queue<Upload>(sized.Where(x => x.Size >= _opt.LargeUpload).Select(x => x.U));
+        var workers = Math.Max(1, _opt.MaxTransfers);
+        var largeCap = Math.Max(1, workers / 4);
+        int largeRunning = 0, done = 0, left = uploads.Count;
+        var gate = new object();
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        Parallel.For(0, Math.Min(workers, uploads.Count), new ParallelOptions { MaxDegreeOfParallelism = workers }, _ =>
         {
-            try { UploadOne(u); }
-            catch (NeedLoginException) { throw; }
-            catch (Exception ex) { Fail(u.Path, ex, u.Existing == null ? $"upload new “{PathUtil.Name(u.Path)}”" : $"upload “{PathUtil.Name(u.Path)}”"); }
-            var n = Interlocked.Increment(ref done);
-            Progress($"Uploading {n:N0} of {uploads.Count:N0} files…");
+            while (true)
+            {
+                Upload u;
+                bool big;
+                lock (gate)
+                {
+                    _opt.Cancellation.ThrowIfCancellationRequested();
+                    if (clock.Elapsed > _opt.UploadBudget) return;
+                    if (small.Count > 0) { u = small.Dequeue(); big = false; }
+                    else if (large.Count > 0 && largeRunning < largeCap) { u = large.Dequeue(); largeRunning++; big = true; }
+                    else return;                                       // the large ones left are picked up by those already running
+                    left--;
+                }
+                try { UploadOne(u); }
+                catch (NeedLoginException) { throw; }
+                catch (Exception ex) { Fail(u.Path, ex, u.Existing == null ? $"upload new “{PathUtil.Name(u.Path)}”" : $"upload “{PathUtil.Name(u.Path)}”"); }
+                finally { if (big) lock (gate) largeRunning--; }
+                var n = Interlocked.Increment(ref done);
+                Progress($"Uploading {n:N0} of {uploads.Count:N0} files…");
+                if (n % 100 == 0) _state.Commit();                     // an interruption mid-way keeps what's already uploaded
+            }
         });
+        if (left > 0)
+        {
+            BusyFilesWaiting = true;                                   // check again soon
+            Log.Info($"{left:N0} upload(s) continue in the next check (this one ran out of time)");
+        }
     }
 
     void UploadOne(Upload u)
@@ -1156,24 +1431,52 @@ public sealed class CloudEngine
         _opt.Cancellation.ThrowIfCancellationRequested();
         var before = _local.Stat(u.Path) ?? throw new FileNotFoundException("it was removed before it could be uploaded");
         var parent = FolderToken(PathUtil.Parent(u.Path));
-        string tmp = Path.Combine(Path.GetTempPath(), $".lcs-{Guid.NewGuid():N}");
+        var dir = _local.SnapshotDir;
+        // The snapshot needs room for the whole file (plus the others being copied right now): checked up front so a
+        // lack of space skips this upload instead of failing half-way and filling the drive.
+        var reserved = Interlocked.Add(ref _snapReserved, before.Size) - before.Size;
         try
         {
-            // Upload a snapshot, so an app that keeps the file open can't change it half-way.
-            using (var src = _local.OpenForUpload(u.Path))
-            using (var dst = File.Create(tmp))
-                src.CopyToAsync(dst, 1 << 20, _opt.Cancellation).GetAwaiter().GetResult();
-            _opt.Cancellation.ThrowIfCancellationRequested();
-            string SnapshotHash()
+            if (_opt.FreeSpace(dir) - reserved < before.Size + SnapshotMargin)
             {
-                using var snapshot = File.OpenRead(tmp);
-                return Convert.ToHexString(SHA256.HashData(snapshot));
+                var msg = $"Not enough free space on the drive of “{dir}” to upload “{PathUtil.Name(u.Path)}” ({before.Size / 1048576:N0} MB). It will be tried again; free some space.";
+                lock (_resLock) { _res.Info[u.Path] = msg; if (_noted.Add(msg)) Log.Warn(msg); }
+                return;
             }
+            UploadSnapshot(u, before, parent, dir);
+        }
+        finally { Interlocked.Add(ref _snapReserved, -before.Size); }
+    }
+
+    void UploadSnapshot(Upload u, LocalItem before, string parent, string dir)
+    {
+        Directory.CreateDirectory(dir);
+        string tmp = Path.Combine(dir, $".lcs-{Guid.NewGuid():N}");
+        try
+        {
+            // Upload a snapshot, so an app that keeps the file open can't change it half-way. It's hashed while it is
+            // copied, so it is never read again except by the upload itself; the PC file is checked against this hash.
+            long size = 0;
+            using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            using (var src = _local.OpenForUpload(u.Path))
+            using (var dst = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 20))
+            {
+                var buf = new byte[1 << 20];
+                for (int n; (n = src.Read(buf, 0, buf.Length)) > 0;)
+                {
+                    _opt.Cancellation.ThrowIfCancellationRequested();
+                    hasher.AppendData(buf, 0, n);
+                    dst.Write(buf, 0, n);
+                    size += n;
+                }
+            }
+            var hash = Convert.ToHexString(hasher.GetHashAndReset());
+            _opt.Cancellation.ThrowIfCancellationRequested();
             if (u.Existing != null && _pendingMarks.TryGetValue(u.Path, out var pending)
-                && pending.Token == u.Existing && pending.Hash == SnapshotHash()
+                && pending.Token == u.Existing && pending.Hash == hash
                 && _state.Get(u.Path) is { LMTime: BaseEntry.LocalUploadPending } baseline)
             {
-                var marked = MarkUploaded(u.Path, u.Existing, tmp);
+                var marked = MarkUploaded(u.Path, u.Existing, size, hash);
                 if (marked != null)
                 {
                     baseline.LMTime = marked.MTime;
@@ -1183,15 +1486,21 @@ public sealed class CloudEngine
                 else BusyFilesWaiting = true;
                 return;
             }
+            // An existing file keeps its real Lark name (the PC name may be a Windows-safe look-alike or have a number added);
+            // a zipped one is stored with the suffix, which the remote adds again itself.
+            var upName = PathUtil.Name(u.Path);
+            if (u.Existing != null && _r.TryGetValue(u.Path, out var cur) && !string.IsNullOrEmpty(cur.LarkName))
+                upName = SpecialTokens.IsZip(u.Existing) && cur.LarkName.EndsWith(SpecialTokens.ZipSuffix, StringComparison.OrdinalIgnoreCase)
+                    ? cur.LarkName[..^SpecialTokens.ZipSuffix.Length] : cur.LarkName;
             string tok;
-            try { tok = _remote.Upload(tmp, parent, PathUtil.Name(u.Path), u.Existing); }
+            try { tok = _remote.Upload(tmp, parent, upName, u.Existing); }
             catch (LarkApiException ex) when (ex.IsBlocked && _opt.ZipBlocked && _remote is RemoteFeatures rf)
             {
                 RemoteFeatures.LastZipProtected = false;
-                tok = rf.UploadZipped(tmp, parent, PathUtil.Name(u.Path), u.Existing);
+                tok = rf.UploadZipped(tmp, parent, upName, u.Existing);
                 var pw = RemoteFeatures.LastZipProtected ? $" (if Windows asks for a password, it's “{ProtectedZip.Password}”)" : "";
                 lock (_resLock)
-                    _res.Info[u.Path] = $"Lark's security filter blocks this file, so it's stored in Lark as “{PathUtil.Name(u.Path)}{SpecialTokens.ZipSuffix}”. " +
+                    _res.Info[u.Path] = $"Lark's security filter blocks this file, so it's stored in Lark as “{upName}{SpecialTokens.ZipSuffix}”. " +
                                         $"On PCs with Lark Cloud Drive it shows as the normal file; in the browser, download and unzip it{pw}.";
                 Log.Info($"{u.Path}: blocked by Lark's filter; stored zipped");
             }
@@ -1202,15 +1511,15 @@ public sealed class CloudEngine
             }
             _dirtyRemote.Add(parent);
             _index.Put(new RemoteEntry { Path = u.Path, Token = tok, Type = Kinds.File }, parent);
-            var after = MarkUploaded(u.Path, tok, tmp);
+            var after = MarkUploaded(u.Path, tok, size, hash);
             _state.Put(new BaseEntry
             {
-                Path = u.Path, Kind = Kinds.File, Token = tok, RType = "file", RMTime = null,
-                Size = new FileInfo(tmp).Length, LMTime = after?.MTime ?? BaseEntry.LocalUploadPending,
+                Path = u.Path, Kind = Kinds.File, Token = tok, RType = "file", RMTime = BaseEntry.PendingMark(_opt.Now()),
+                Size = size, LMTime = after?.MTime ?? BaseEntry.LocalUploadPending,
             });
             if (after == null)
             {
-                _pendingMarks[u.Path] = (tok, SnapshotHash());
+                _pendingMarks[u.Path] = (tok, hash);
                 BusyFilesWaiting = true;
             }
             else _pendingMarks.TryRemove(u.Path, out _);
@@ -1220,9 +1529,9 @@ public sealed class CloudEngine
         finally { try { File.Delete(tmp); } catch { } }
     }
 
-    LocalItem? MarkUploaded(string path, string token, string snapshot)
+    LocalItem? MarkUploaded(string path, string token, long size, string hash)
     {
-        try { return _local.MarkUploaded(path, token, snapshot); }
+        try { return _local.MarkUploaded(path, token, size, hash); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             Log.Info($"Will recheck {path} after upload: {ex.Message}");
@@ -1301,7 +1610,11 @@ public sealed class CloudEngine
         var anyRo = _rootEditable == false || !_roFolders.IsEmpty || _opt.DocCopies || _roApplied.Count > 0;
         if (!anyRo) return;
         var changed = false;
-        foreach (var l in _local.Scan().Where(x => !x.IsDir && x.IsPlaceholder))
+        // The pass's own PC list, plus files it put on the PC (a second full scan per pass is slow on big folders).
+        var items = _l.Values.Where(x => !x.IsDir && x.IsPlaceholder).ToList();
+        foreach (var b in _state.All())
+            if (b.Kind == Kinds.File && !_l.ContainsKey(b.Path) && _local.Stat(b.Path) is { IsDir: false, IsPlaceholder: true } s) items.Add(s);
+        foreach (var l in items)
         {
             var want = ShouldBeReadOnly(l.Path, l.Identity);
             try
@@ -1318,47 +1631,51 @@ public sealed class CloudEngine
     // ================================================================ deletions
     void DeleteHere(List<string> paths)
     {
+        // Deepest level first (a folder is only removed once what's in it is gone); the items of one level are
+        // independent, so they go several at a time.
         var n = 0;
-        foreach (var p in paths.OrderByDescending(PathUtil.Depth))
-        {
-            _opt.Cancellation.ThrowIfCancellationRequested();
-            if (paths.Count > 20 && ++n % 50 == 0) Progress($"Removing items deleted in Lark: {n:N0} of {paths.Count:N0}…");
-            try
+        var options = new ParallelOptions { MaxDegreeOfParallelism = Math.Clamp(_opt.MaxTransfers, 1, 8), CancellationToken = _opt.Cancellation };
+        foreach (var level in paths.GroupBy(PathUtil.Depth).OrderByDescending(g => g.Key))
+            Parallel.ForEach(level, options, p =>
             {
-                _l.TryGetValue(p, out var observed);
-                var l = _local.Stat(p);
-                if (l == null || observed == null || l.IsDir != observed.IsDir || l.Identity != observed.Identity
-                    || (!l.IsDir && (l.Size != observed.Size || l.MTime != observed.MTime || l.InSync != observed.InSync
-                                    || l.OnDisk != observed.OnDisk)))
+                _opt.Cancellation.ThrowIfCancellationRequested();
+                if (paths.Count > 20 && Interlocked.Increment(ref n) % 50 == 0) Progress($"Removing items deleted in Lark: {n:N0} of {paths.Count:N0}…");
+                try
                 {
-                    BusyFilesWaiting = true;
-                    continue;
-                }
-                if (l.IsDir)
-                {
-                    var full = _local.FullPath(p);
-                    if (Directory.Exists(full) && Directory.EnumerateFileSystemEntries(full).Any())
+                    _l.TryGetValue(p, out var observed);
+                    var l = _local.Stat(p);
+                    if (l == null || observed == null || l.IsDir != observed.IsDir || l.Identity != observed.Identity
+                        || (!l.IsDir && (l.Size != observed.Size || l.MTime != observed.MTime || l.InSync != observed.InSync
+                                        || l.OnDisk != observed.OnDisk)))
                     {
-                        _state.Remove(p);                                // something inside is kept: the folder stays
-                        continue;
+                        BusyFilesWaiting = true;
+                        return;
                     }
-                    _local.Delete(p, recycle: false);
+                    if (l.IsDir)
+                    {
+                        var full = _local.FullPath(p);
+                        if (Directory.Exists(full) && Directory.EnumerateFileSystemEntries(full).Any())
+                        {
+                            _state.Remove(p);                                // something inside is kept: the folder stays
+                            return;
+                        }
+                        _local.Delete(p, recycle: false);
+                    }
+                    else
+                    {
+                        // Lark's trash already has it. Only a copy with changes Lark never got goes to the Recycle Bin
+                        // (that's slow, so unchanged copies are simply removed).
+                        var b = _b.GetValueOrDefault(p);
+                        var kept = l.OnDisk && (b == null || LocalChanged(l, b));
+                        _local.Delete(p, recycle: kept);
+                        if (kept) Log.Info($"{p} was deleted in Lark; this PC's copy is in the Recycle Bin");
+                    }
+                    _state.RemoveTree(p);
+                    lock (_resLock) _res.DeletedLocal++;
+                    Log.Info($"Deleted here (deleted in Lark): {p}");
                 }
-                else
-                {
-                    // Lark's trash already has it. Only a copy with changes Lark never got goes to the Recycle Bin
-                    // (that's slow, so unchanged copies are simply removed).
-                    var b = _b.GetValueOrDefault(p);
-                    var kept = l.OnDisk && (b == null || LocalChanged(l, b));
-                    _local.Delete(p, recycle: kept);
-                    if (kept) Log.Info($"{p} was deleted in Lark; this PC's copy is in the Recycle Bin");
-                }
-                _state.RemoveTree(p);
-                lock (_resLock) _res.DeletedLocal++;
-                Log.Info($"Deleted here (deleted in Lark): {p}");
-            }
-            catch (Exception ex) { Fail(p, ex, "delete this item (it was deleted in Lark)"); }
-        }
+                catch (Exception ex) { Fail(p, ex, "delete this item (it was deleted in Lark)"); }
+            });
     }
 
     void DeleteInLark(List<BaseEntry> items, Dictionary<string, RemoteEntry>? reviewedEntries)
@@ -1433,24 +1750,38 @@ public sealed class CloudEngine
                 || expected.Path != PathUtil.Join(folder.Path, child.Path))
                 return false;
         }
-        foreach (var child in children)
+        if (children is RemoteListing { Incomplete: true }) return false;      // there may be more in it than we can see
+        // The children go several at a time. Any "no" (the PC copy is back, something changed) stops the rest from
+        // starting; items already sent to Lark's trash stay there, and the folder itself is then left alone.
+        var stopped = false;
+        var errors = new ConcurrentBag<Exception>();
+        var options = new ParallelOptions { MaxDegreeOfParallelism = Math.Clamp(_opt.MaxTransfers, 1, 8), CancellationToken = _opt.Cancellation };
+        Parallel.ForEach(children, options, (child, state) =>
         {
-            _opt.Cancellation.ThrowIfCancellationRequested();
-            if (_local.CheckPresence(localRoot) != LocalPresence.Missing) return false;
+            if (Volatile.Read(ref stopped)) return;
             try
             {
-                if (child.IsFolder)
+                _opt.Cancellation.ThrowIfCancellationRequested();
+                if (_local.CheckPresence(localRoot) != LocalPresence.Missing
+                    || (child.IsFolder && !DeleteReviewedFolder(reviewed[child.Token], reviewed, localRoot)))
                 {
-                    if (!DeleteReviewedFolder(reviewed[child.Token], reviewed, localRoot)) return false;
+                    Volatile.Write(ref stopped, true);
+                    state.Stop();
+                    return;
                 }
-                else _remote.Delete(child.Token, child.Type);
+                if (!child.IsFolder) _remote.Delete(child.Token, child.Type);
             }
+            catch (OperationCanceledException) when (_opt.Cancellation.IsCancellationRequested) { throw; }
             catch (LarkApiException ex) when (ex.IsGone) { }
             catch (LarkApiException ex) when (ex.IsPermission)
             {
-                throw new IOException($"Couldn't remove reviewed item {reviewed[child.Token].Path}: {ex.Message}", ex);
+                errors.Add(new IOException($"Couldn't remove reviewed item {reviewed[child.Token].Path}: {ex.Message}", ex));
+                state.Stop();
             }
-        }
+            catch (Exception ex) { errors.Add(ex); state.Stop(); }
+        });
+        if (!errors.IsEmpty) throw errors.First();
+        if (stopped) return false;
         if (children.Count > 0 && _remote.ListFolder(folder.Token).Count > 0) return false;
         if (_local.CheckPresence(localRoot) != LocalPresence.Missing) return false;
         _remote.Delete(folder.Token, Kinds.Folder);
@@ -1472,6 +1803,8 @@ public sealed class CloudEngine
             Log.Info($"Lark couldn't delete “{path}” in one go ({ex.Message}); deleting what's inside it first");
         }
         var kids = _remote.ListFolder(token);
+        if (kids is RemoteListing { Incomplete: true })
+            throw new IOException($"“{path}” has items in Lark that couldn't be listed; not deleting it (the next check tries again)");
         var errors = new ConcurrentBag<Exception>();
         Parallel.ForEach(kids, new ParallelOptions { MaxDegreeOfParallelism = Math.Clamp(_opt.MaxTransfers, 1, 8) }, k =>
         {
@@ -1525,8 +1858,11 @@ public sealed class CloudEngine
             return;
         }
         var byToken = _index.Entries().GroupBy(e => e.Token).ToDictionary(g => g.Key, g => g.First());
-        foreach (var b in _state.All().Where(b => b.RMTime == null && b.Token != null))
-            if (byToken.TryGetValue(b.Token!, out var r))
+        // What we did in this very pass is adopted as it is. A marker left by an earlier pass (its own re-check
+        // failed) is adopted only if Lark's date isn't much newer than the marker: otherwise someone else edited it.
+        foreach (var b in _state.All().Where(b => b.RMTimePending && b.Token != null))
+            if (byToken.TryGetValue(b.Token!, out var r)
+                && (b.PendingSince is not { } since || since >= _passStart.AddSeconds(-1) || r.MTimeUtc <= since + PendingSlack))
             {
                 b.RMTime = r.MTime;
                 _state.Put(b);

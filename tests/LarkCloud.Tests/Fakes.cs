@@ -40,9 +40,17 @@ public sealed class FakeRemote : IRemoteDrive
         }
     }
 
+    readonly Dictionary<string, string> _byPath = new();          // path -> token, checked before use (moves/renames make entries stale)
+
     public Node? Find(string path)
     {
-        lock (_lock) return Nodes.Values.FirstOrDefault(n => PathOf(n.Token) == path);
+        lock (_lock)
+        {
+            if (_byPath.TryGetValue(path, out var t) && Nodes.TryGetValue(t, out var hit) && PathOf(t) == path) return hit;
+            var n = Nodes.Values.FirstOrDefault(n => PathOf(n.Token) == path);
+            if (n != null) _byPath[path] = n.Token;
+            return n;
+        }
     }
 
     public string FolderFor(string path) => path.Length == 0 ? RootToken : Find(path)?.Token ?? AddFolder(path);
@@ -57,7 +65,7 @@ public sealed class FakeRemote : IRemoteDrive
     {
         var parent = FolderFor(PathUtil.Parent(path));
         var n = new Node { Token = Tok("box"), Name = PathUtil.Name(path), Parent = parent, Content = content, MTime = Tick() };
-        lock (_lock) Nodes[n.Token] = n;
+        lock (_lock) { Nodes[n.Token] = n; _byPath[PathUtil.Join(PathOf(parent), n.Name)] = n.Token; }
         return n.Token;
     }
 
@@ -88,9 +96,13 @@ public sealed class FakeRemote : IRemoteDrive
     public byte[]? Content(string path) => Find(path)?.Content;
 
     // ---------------------------------------------------------------- IRemoteDrive
+    public Func<string, Exception?>? ListFault;                // by folder token: an error to throw instead of listing
+    public Action? MutationHook;                               // runs after a move or rename
+
     public List<RemoteEntry> ListFolder(string folder)
     {
         Interlocked.Increment(ref ListCalls);
+        if (ListFault?.Invoke(folder) is { } fault) throw fault;
         lock (_lock)
         {
             if (folder != RootToken && !Nodes.ContainsKey(folder)) throw new LarkApiException(1061007, "file has been delete.");
@@ -134,6 +146,7 @@ public sealed class FakeRemote : IRemoteDrive
             }
             var tok = Tok("box");
             Nodes[tok] = new Node { Token = tok, Name = name, Parent = parent, Content = content, MTime = Tick() };
+            _byPath[PathUtil.Join(PathOf(parent), name)] = tok;
             return tok;
         }
     }
@@ -143,7 +156,7 @@ public sealed class FakeRemote : IRemoteDrive
         if (parent == RootToken && ReadOnly.Contains(RootToken)) throw new LarkApiException(1061004, "forbidden");
         Calls.Enqueue(("mkdir", name));
         var tok = Tok("fld");
-        lock (_lock) Nodes[tok] = new Node { Token = tok, Name = name, Parent = parent, Type = Kinds.Folder, MTime = Tick() };
+        lock (_lock) { Nodes[tok] = new Node { Token = tok, Name = name, Parent = parent, Type = Kinds.Folder, MTime = Tick() }; _byPath[PathUtil.Join(PathOf(parent), name)] = tok; }
         return tok;
     }
 
@@ -170,12 +183,14 @@ public sealed class FakeRemote : IRemoteDrive
     {
         Calls.Enqueue(("move", token));
         lock (_lock) { Nodes[token].Parent = dest; Nodes[token].MTime = Tick(); }
+        MutationHook?.Invoke();
     }
 
     public void Rename(string token, string type, string newName)
     {
         Calls.Enqueue(("rename", token));
         lock (_lock) { Nodes[token].Name = newName; Nodes[token].MTime = Tick(); }
+        MutationHook?.Invoke();
     }
 }
 
@@ -271,7 +286,13 @@ public sealed class FakeLocal : ICloudLocal
     }
 
     // ---------------------------------------------------------------- ICloudLocal
-    public List<LocalItem> Scan() { lock (_lock) return Items.Keys.Select(k => Stat(k)!).ToList(); }
+    public List<LocalItem> Scan() { lock (_lock) return Items.Select(kv => Describe(kv.Key, kv.Value)).ToList(); }
+
+    static LocalItem Describe(string key, Item i) => new()
+    {
+        Path = key, IsDir = i.IsDir, Size = i.IsDir ? 0 : i.Size, MTime = i.MTime, IsPlaceholder = i.IsPlaceholder,
+        Identity = i.Identity, InSync = i.InSync, OnDisk = i.Data != null, Pinned = i.Pinned, LastUse = i.MTime, ReadOnly = i.ReadOnly,
+    };
 
     public Func<string, LocalPresence>? PresenceOverride;
     public LocalPresence CheckPresence(string rel) =>
@@ -283,11 +304,7 @@ public sealed class FakeLocal : ICloudLocal
         {
             if (!Items.TryGetValue(rel, out var i)) return null;
             var key = Items.Keys.First(k => k.Equals(rel, StringComparison.OrdinalIgnoreCase));
-            return new LocalItem
-            {
-                Path = key, IsDir = i.IsDir, Size = i.IsDir ? 0 : i.Size, MTime = i.MTime, IsPlaceholder = i.IsPlaceholder,
-                Identity = i.Identity, InSync = i.InSync, OnDisk = i.Data != null, Pinned = i.Pinned, LastUse = i.MTime, ReadOnly = i.ReadOnly,
-            };
+            return Describe(key, i);
         }
     }
 
@@ -375,8 +392,22 @@ public sealed class FakeLocal : ICloudLocal
 
     public void SetReadOnly(string rel, bool readOnly) { lock (_lock) Items[rel].ReadOnly = readOnly; }
 
+    public Func<string, Exception?>? OpenFault;                // an error to throw when a file is opened for reading
+
+    public readonly ConcurrentDictionary<string, int> Opens = new(StringComparer.OrdinalIgnoreCase);       // reads of a file's data for upload/verify
+    public readonly ConcurrentDictionary<string, (long Size, string Hash)> MarkedWith = new(StringComparer.OrdinalIgnoreCase);
+
+    public LocalItem? MarkUploaded(string rel, string token, long size, string hash)
+    {
+        MarkedWith[rel] = (size, hash);
+        using var current = OpenForUpload(rel);
+        return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(current)) == hash ? MarkSynced(rel, token) : null;
+    }
+
     public Stream OpenForUpload(string rel)
     {
+        Opens.AddOrUpdate(rel, 1, (_, n) => n + 1);
+        if (OpenFault?.Invoke(rel) is { } fault) throw fault;
         lock (_lock)
         {
             var i = Items[rel];

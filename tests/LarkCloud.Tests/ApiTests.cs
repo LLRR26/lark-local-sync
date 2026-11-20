@@ -24,6 +24,12 @@ public sealed class FakeLarkHttp : HttpMessageHandler
     public readonly List<(string Space, string Parent, WikiNode Node)> Wiki = new();
     public bool PermissionAuth = true;                    // members/auth answers "can edit"
     public readonly List<FoundFolder> SearchResults = new();
+    public readonly HashSet<string> BadTokens = new();    // listed with an empty token, like an entry Lark returned half-empty
+    public bool HangListing;                              // listing requests never answer (until cancelled)
+    public readonly System.Collections.Concurrent.ConcurrentDictionary<int, int> PartAttempts = new();   // upload_part requests per part number
+    public Func<int, int, HttpResponseMessage?>? PartFault;    // (part, attempt) -> a reply instead of storing the part
+    public int Prepares;
+    public Func<string?, HttpResponseMessage?>? OverwriteHook;   // existing token (null = new file) -> a reply instead of storing a single-request upload
 
     static HttpResponseMessage Json(JsonNode body, HttpStatusCode code = HttpStatusCode.OK) =>
         new(code) { Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json") };
@@ -31,7 +37,15 @@ public sealed class FakeLarkHttp : HttpMessageHandler
     static HttpResponseMessage Ok(JsonNode data) => Json(new JsonObject { ["code"] = 0, ["msg"] = "success", ["data"] = data });
 
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage req, CancellationToken ct) => Task.FromResult(Handle(req));
-    protected override HttpResponseMessage Send(HttpRequestMessage req, CancellationToken ct) => Handle(req);
+    protected override HttpResponseMessage Send(HttpRequestMessage req, CancellationToken ct)
+    {
+        if (HangListing && req.RequestUri!.AbsolutePath == "/open-apis/drive/v1/files")
+        {
+            ct.WaitHandle.WaitOne();
+            ct.ThrowIfCancellationRequested();
+        }
+        return Handle(req);
+    }
 
     HttpResponseMessage Handle(HttpRequestMessage req)
     {
@@ -97,7 +111,7 @@ public sealed class FakeLarkHttp : HttpMessageHandler
             var more = start + PageSize < kids.Count;
             return Ok(new JsonObject
             {
-                ["files"] = new JsonArray(page.Select(k => (JsonNode)new JsonObject { ["token"] = k.Token, ["name"] = k.Path, ["type"] = k.Type, ["modified_time"] = k.MTime, ["url"] = k.Url }).ToArray()),
+                ["files"] = new JsonArray(page.Select(k => (JsonNode)new JsonObject { ["token"] = BadTokens.Contains(k.Token) ? "" : k.Token, ["name"] = k.Path, ["type"] = k.Type, ["modified_time"] = k.MTime, ["url"] = k.Url }).ToArray()),
                 ["has_more"] = more, ["next_page_token"] = more ? (start + PageSize).ToString() : "",
             });
         }
@@ -141,9 +155,12 @@ public sealed class FakeLarkHttp : HttpMessageHandler
                 return new HttpResponseMessage(HttpStatusCode.Forbidden) { Content = new StringContent("<html>Forbidden</html>", Encoding.UTF8, "text/html") };
             if (isPart)
             {
+                var attempt = PartAttempts.AddOrUpdate(int.Parse(fields["seq"]), 1, (_, n) => n + 1);
+                if (PartFault?.Invoke(int.Parse(fields["seq"]), attempt) is { } fault) return fault;
                 _uploads[fields["upload_id"]].Parts[int.Parse(fields["seq"])] = file;
                 return Ok(new JsonObject());
             }
+            if (OverwriteHook?.Invoke(fields.GetValueOrDefault("file_token")) is { } hooked) return hooked;
             if (long.Parse(fields["size"]) != file.Length) return Json(new JsonObject { ["code"] = 1061002, ["msg"] = "params error" }, HttpStatusCode.BadRequest);
             if (file.Length == 0) return Json(new JsonObject { ["code"] = 1061002, ["msg"] = "params error" }, HttpStatusCode.BadRequest);
             return Ok(new JsonObject { ["file_token"] = Store(fields["parent_node"], fields["file_name"], fields.GetValueOrDefault("file_token"), file) });
@@ -151,6 +168,7 @@ public sealed class FakeLarkHttp : HttpMessageHandler
         if (path == "/open-apis/drive/v1/files/upload_prepare")
         {
             var meta = JsonNode.Parse(req.Content!.ReadAsStringAsync().Result)!.AsObject();
+            Prepares++;
             var id = "up" + _uploads.Count;
             _uploads[id] = (meta, new());
             var size = (long)meta["size"]!;
@@ -304,7 +322,12 @@ public class ApiTests
     {
         using var f = new ApiFixture();
         f.Http.Wiki.Add(("1", "", new WikiNode("", "obj", "file", "Broken node", false, "0")));
-        Assert.Throws<IOException>(() => f.Api.WikiNodes("1", null));
+        f.Http.Wiki.Add(("1", "", new WikiNode("n2", "o2", "file", "Fine node", false, "0")));
+        // The odd node is left out (the rest still syncs) but the listing says it is incomplete, so the engine
+        // never reads "missing" as "deleted in Lark".
+        var nodes = Assert.IsType<WikiNodeList>(f.Api.WikiNodes("1", null));
+        Assert.Equal("Fine node", Assert.Single(nodes).Title);
+        Assert.True(nodes.Incomplete);
     }
 
     [Fact]
@@ -409,6 +432,57 @@ public class ApiTests
         Assert.Equal(tok, f.Api.Upload(src, "fldROOT", "a.txt", tok));
         Assert.Equal("hello again", Encoding.UTF8.GetString(f.Http.R.Content("a.txt")!));
         Directory.Delete(dir, true);
+    }
+
+    static string TempFile(string text)
+    {
+        var p = Path.Combine(Path.GetTempPath(), "lcs-up-" + Guid.NewGuid().ToString("N") + ".txt");
+        File.WriteAllText(p, text);
+        return p;
+    }
+
+    [Fact]
+    public void Server_errors_while_overwriting_do_not_switch_overwrite_off_or_upload_a_new_file()
+    {
+        using var f = new ApiFixture();
+        var src = TempFile("v1");
+        var tok = f.Api.Upload(src, "fldROOT", "a.txt", null);
+        f.Http.OverwriteHook = existing => existing != null ? new HttpResponseMessage(HttpStatusCode.InternalServerError) : null;
+        for (var i = 0; i < 3; i++)
+            Assert.Equal(500, Assert.Throws<LarkApiException>(() => f.Api.Upload(src, "fldROOT", "a.txt", tok)).Code);
+        Assert.True(f.Api.OverwriteSupported);
+        Assert.Single(f.Http.R.Paths());                      // no second copy
+        File.Delete(src);
+    }
+
+    [Fact]
+    public void Overwriting_a_file_deleted_in_Lark_fails_instead_of_uploading_it_again()
+    {
+        using var f = new ApiFixture();
+        var src = TempFile("v1");
+        var tok = f.Api.Upload(src, "fldROOT", "a.txt", null);
+        f.Http.OverwriteHook = existing => existing != null
+            ? new HttpResponseMessage(HttpStatusCode.BadRequest) { Content = new StringContent("""{"code":1061007,"msg":"file has been delete."}""", Encoding.UTF8, "application/json") }
+            : null;
+        Assert.True(Assert.Throws<LarkApiException>(() => f.Api.Upload(src, "fldROOT", "a.txt", tok)).IsGone);
+        Assert.True(f.Api.OverwriteSupported);
+        Assert.Single(f.Http.R.Paths());
+        File.Delete(src);
+    }
+
+    [Fact]
+    public void When_overwrite_is_really_unsupported_it_falls_back_to_upload_and_replace()
+    {
+        using var f = new ApiFixture();
+        var src = TempFile("v1");
+        var tok = f.Api.Upload(src, "fldROOT", "a.txt", null);
+        f.Http.OverwriteHook = existing => existing != null
+            ? new HttpResponseMessage(HttpStatusCode.BadRequest) { Content = new StringContent("""{"code":1061002,"msg":"params error"}""", Encoding.UTF8, "application/json") }
+            : null;
+        for (var i = 0; i < 3; i++) Assert.NotEqual(tok, tok = f.Api.Upload(src, "fldROOT", "a.txt", tok));
+        Assert.False(f.Api.OverwriteSupported);
+        Assert.Single(f.Http.R.Paths());                      // the old one was trashed each time
+        File.Delete(src);
     }
 
     [Fact]

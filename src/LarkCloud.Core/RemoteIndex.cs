@@ -15,6 +15,7 @@ public sealed class RemoteIndex
     readonly object _lock = new();
     readonly Dictionary<string, Node> _nodes = new();
     readonly Dictionary<string, HashSet<string>> _kids = new();
+    HashSet<string> _incomplete = new();       // folders whose listing had to skip an entry (see RemoteListing)
     public bool Complete { get; private set; }
     public int LastListCalls { get; private set; }
 
@@ -25,6 +26,9 @@ public sealed class RemoteIndex
     }
 
     string Root => _remote.RootToken;
+
+    /// <summary>Folders (tokens) whose last listing left an entry out: nothing under them may be treated as gone from Lark.</summary>
+    public HashSet<string> IncompleteFolders() { lock (_lock) return new HashSet<string>(_incomplete); }
 
     public int FolderCount { get { lock (_lock) return _kids.Count; } }
 
@@ -52,6 +56,7 @@ public sealed class RemoteIndex
         public readonly Dictionary<string, HashSet<string>> Kids = new();
         public List<string> Level = new(), Next = new();
         public int Calls, Seen;
+        public readonly HashSet<string> Incomplete = new();
         public readonly HashSet<string> Touched = new();   // folders our own changes (Refresh/Put/Remove) touched meanwhile
     }
 
@@ -85,6 +90,7 @@ public sealed class RemoteIndex
                 {
                     p.Calls++;
                     p.Kids[folder] = new HashSet<string>();
+                    if (entries is RemoteListing { Incomplete: true }) p.Incomplete.Add(folder);
                     foreach (var e in entries ?? new())
                     {
                         p.Kids[folder].Add(e.Token);
@@ -104,6 +110,7 @@ public sealed class RemoteIndex
                 _kids.Clear();
                 foreach (var kv in p.Nodes) _nodes[kv.Key] = kv.Value;
                 foreach (var kv in p.Kids) _kids[kv.Key] = kv.Value;
+                _incomplete = p.Incomplete;
                 LastListCalls = p.Calls;
                 touched = p.Touched.ToList();
                 _p = null;
@@ -145,10 +152,13 @@ public sealed class RemoteIndex
             var next = new List<string>();
             lock (_lock)
             {
+                var removed = new List<(string Token, string Folder)>();       // dropped after all listings: another listing of this batch may show them moved
                 foreach (var (folder, entries) in results)
                 {
                     calls++;
                     Touch(folder);
+                    _incomplete.Remove(folder);
+                    if (entries is RemoteListing { Incomplete: true }) _incomplete.Add(folder);
                     if (entries == null)
                     {
                         if (_nodes.TryGetValue(folder, out var gone))
@@ -160,19 +170,23 @@ public sealed class RemoteIndex
                         continue;
                     }
                     var now = entries.Select(e => e.Token).ToHashSet();
-                    foreach (var g in (_kids.GetValueOrDefault(folder) ?? new()).Except(now).ToList()) Drop(g);
+                    foreach (var g in (_kids.GetValueOrDefault(folder) ?? new()).Except(now)) removed.Add((g, folder));
                     _kids[folder] = now;
                     foreach (var e in entries)
                     {
+                        var movedHere = false;
                         if (_nodes.TryGetValue(e.Token, out var old) && old.Parent != folder && _kids.TryGetValue(old.Parent, out var oldSib))
                         {
                             Touch(old.Parent);
                             oldSib.Remove(e.Token);                  // moved here from another folder
+                            movedHere = true;
                         }
                         _nodes[e.Token] = new Node { Entry = e, Parent = folder };
-                        if (e.IsFolder && !_kids.ContainsKey(e.Token) && !listed.Contains(e.Token)) next.Add(e.Token);
+                        if (e.IsFolder && (!_kids.ContainsKey(e.Token) || movedHere) && !listed.Contains(e.Token)) next.Add(e.Token);   // (a moved folder is listed again: what we know of it may be out of date)
                     }
                 }
+                foreach (var (g, folder) in removed)
+                    if (!_nodes.TryGetValue(g, out var n) || n.Parent == folder) Drop(g);       // (not if it now sits in another folder)
             }
             total += next.Distinct().Count();
             progress?.Invoke(calls, total);
@@ -186,6 +200,7 @@ public sealed class RemoteIndex
         if (_kids.Remove(token, out var children))
             foreach (var c in children) Drop(c);
         _nodes.Remove(token);
+        _incomplete.Remove(token);
     }
 
     /// <summary>Every entry with its full relative path.</summary>

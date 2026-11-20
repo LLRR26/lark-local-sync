@@ -44,6 +44,13 @@ public interface IKnownLength
     long? TotalLength { get; }
 }
 
+/// <summary>A folder listing that had to leave out entries Lark returned half-empty. Nothing under such a folder may be
+/// treated as "gone from Lark" (see RemoteIndex / CloudEngine): the missing entry is unknown, not deleted.</summary>
+public sealed class RemoteListing : List<RemoteEntry>
+{
+    public bool Incomplete { get; set; }
+}
+
 /// <summary>Everything the sync engine needs from Lark Drive. LarkApi is the real one; the tests use a fake.</summary>
 public interface IRemoteDrive
 {
@@ -69,9 +76,14 @@ public sealed record FoundFolder(string Token, string Name, string? Url, string?
 
 public sealed record WikiNode(string NodeToken, string ObjToken, string ObjType, string Title, bool HasChild, string EditTime);
 
+public sealed class WikiNodeList : List<WikiNode>
+{
+    public bool Incomplete { get; set; }
+}
+
 public sealed class LarkApi : IRemoteDrive, ILarkExtras
 {
-    public const long SingleUploadLimit = 20L * 1024 * 1024;
+    public long SingleUploadLimit { get; set; } = 20L * 1024 * 1024;       // bigger files go up in parts (settable for tests)
     static readonly HashSet<long> TokenErrors = new() { 99991661, 99991663, 99991668, 99991677 };
     const long RateLimit = 99991400;
 
@@ -86,6 +98,9 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
     public bool OverwriteSupported = true;
     int _overwriteFailures;
     public Action<TimeSpan>? Sleep;
+    /// <summary>Per HTTP request (send until the answer is read); time spent waiting for the limiter or backing off doesn't count.</summary>
+    public TimeSpan RequestTimeout = TimeSpan.FromSeconds(60);
+    readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _skippedLogged = new();
 
     public LarkApi(LarkAuth auth, HttpClient http, string rootToken, double minIntervalSeconds = 0.12,
         CancellationToken lifetime = default, LarkRequestLimiter? limiter = null)
@@ -136,7 +151,8 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
 
     /// <summary>Sends a request (rebuilt for every attempt) and returns the response.
     /// JSON answers with code != 0 become LarkApiException; non-JSON answers are returned when `raw`.</summary>
-    HttpResponseMessage Send(Func<HttpRequestMessage> make, string path, bool raw = false, CancellationToken ct = default, int serverErrorTries = 6)
+    HttpResponseMessage Send(Func<HttpRequestMessage> make, string path, bool raw = false, CancellationToken ct = default, int serverErrorTries = 6,
+                             TimeSpan? timeout = null)
     {
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime);
         ct = linked.Token;
@@ -149,9 +165,12 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
             using var req = make();
             req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
             HttpResponseMessage r;
+            // The timeout covers just this send/receive; waiting for the limiter or backing off only answers to ct.
+            using var sendCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            if (timeout is TimeSpan t) sendCts.CancelAfter(t);
             try
             {
-                r = _http.Send(req, raw ? HttpCompletionOption.ResponseHeadersRead : HttpCompletionOption.ResponseContentRead, ct);
+                r = _http.Send(req, raw ? HttpCompletionOption.ResponseHeadersRead : HttpCompletionOption.ResponseContentRead, sendCts.Token);
             }
             catch (HttpRequestException ex)
             {
@@ -159,9 +178,9 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
                 Backoff(attempt, $"network error: {ex.Message}", ct);
                 continue;
             }
-            catch (TaskCanceledException) when (!ct.IsCancellationRequested)
+            catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
             {
-                if (attempt == 5) throw;
+                if (attempt == 5) throw new LarkUnreachableException("Lark didn't answer in time", ex);
                 Backoff(attempt, "timed out", ct);
                 continue;
             }
@@ -221,14 +240,13 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
     }
 
     JsonObject Json(HttpMethod method, string path, Dictionary<string, string>? query = null, JsonNode? json = null,
-                    Func<HttpContent>? content = null, int timeoutS = 60, int serverErrorTries = 6, bool listing = false)
+                    Func<HttpContent>? content = null, int? timeoutS = null, int serverErrorTries = 6, bool listing = false)
     {
         var url = _base + path + (query == null ? "" : "?" + string.Join("&", query.Select(kv => $"{kv.Key}={Uri.EscapeDataString(kv.Value)}")));
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutS));
         using var r = Send(() => new HttpRequestMessage(method, url)
         {
             Content = content?.Invoke() ?? (json == null ? null : new StringContent(json.ToJsonString(), Encoding.UTF8, "application/json")),
-        }, path, ct: cts.Token, serverErrorTries: serverErrorTries);
+        }, path, serverErrorTries: serverErrorTries, timeout: timeoutS is int sec ? TimeSpan.FromSeconds(sec) : RequestTimeout);
         var body = ReadJson(r);
         if (listing && ((long?)body["code"] != 0 || body["data"] is not JsonObject))
             throw new IOException("Lark returned an invalid folder listing.");
@@ -263,9 +281,21 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
     }
 
     // ------------------------------------------------------------ listing
+    static string? Str(JsonNode? n) => n is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
+
+    /// <summary>One bad entry must not stop the whole folder from syncing, and must never look like "deleted in Lark":
+    /// it's left out, logged once, and the listing says it's incomplete so nothing under this folder is removed this pass.</summary>
+    void Skipped(string where, JsonNode? entry)
+    {
+        var text = entry?.ToJsonString() ?? "null";
+        if (_skippedLogged.TryAdd(where + text, 0))
+            Log.Warn($"Lark returned an incomplete entry in {where}; skipping it and leaving everything in that folder alone: {text}");
+    }
+
     public List<RemoteEntry> ListFolder(string folderToken)
     {
-        var outList = new List<RemoteEntry>();
+        var skipped = false;
+        var outList = new RemoteListing();
         var seen = new HashSet<string>(StringComparer.Ordinal);
         string? page = null;
         while (true)
@@ -277,11 +307,15 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
                 throw new IOException("Lark's folder listing is missing its files.");
             foreach (var f in files)
             {
-                var name = (string?)f?["name"];
-                var tok = (string?)f?["token"];
-                var type = (string?)f?["type"];
+                var name = Str(f?["name"]);
+                var tok = Str(f?["token"]);
+                var type = Str(f?["type"]);
                 if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(tok) || string.IsNullOrEmpty(type))
-                    throw new IOException("Lark returned an incomplete file entry.");
+                {
+                    skipped = true;
+                    Skipped(folderToken, f);
+                    continue;
+                }
                 long? size = null;
                 if (f!["size"] is JsonValue sv && long.TryParse(sv.ToString(), out var s)) size = s;
                 outList.Add(new RemoteEntry
@@ -294,6 +328,7 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
             page = NextListingPage(data, seen);
             if (page == null) break;
         }
+        outList.Incomplete = skipped;
         return outList;
     }
 
@@ -320,13 +355,13 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
     public long ProbeSize(string token)
     {
         var path = $"/open-apis/drive/v1/files/{token}/download";
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
         using var r = Send(() =>
         {
             var q = new HttpRequestMessage(HttpMethod.Get, _base + path);
             q.Headers.Range = new RangeHeaderValue(0, 0);
             return q;
-        }, path, raw: true, ct: cts.Token);
+        }, path, raw: true, timeout: RequestTimeout);
+        using var cts = new CancellationTokenSource(RequestTimeout);       // for reading the body below
         if (r.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
             return r.Content.Headers.ContentRange?.Length ?? 0;     // "bytes */0": an empty file has no first byte
         if (r.StatusCode == HttpStatusCode.PartialContent && r.Content.Headers.ContentRange?.Length is long total)
@@ -392,11 +427,13 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
                 _overwriteFailures = 0;
                 return tok;
             }
-            catch (LarkApiException ex) when (!ex.IsPermission && !ex.EmptyRefused && !ex.IsBlocked)
+            catch (LarkApiException ex) when (!ex.IsPermission && !ex.EmptyRefused && !ex.IsBlocked && !ex.IsGone
+                                              && ex.Code != 429 && ex.Code != RateLimit && !(ex.Code >= 500 && ex.Code <= 599))
             {
                 // Overwrite-in-place (keeps the link and history) isn't available on every tenant:
                 // fall back to upload as new + move the old one to the Lark trash.
-                if (++_overwriteFailures >= 3) OverwriteSupported = false;
+                // (Temporary errors and "deleted in Lark" aren't that: they pass through to the caller.)
+                if (Interlocked.Increment(ref _overwriteFailures) >= 3) OverwriteSupported = false;
                 Log.Warn($"In-place overwrite failed ({ex.Message}); using upload + replace");
             }
         }
@@ -616,7 +653,7 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
 
     public List<WikiNode> WikiNodes(string spaceId, string? parentNode)
     {
-        var outList = new List<WikiNode>();
+        var outList = new WikiNodeList();
         var seen = new HashSet<string>(StringComparer.Ordinal);
         string? page = null;
         do
@@ -629,12 +666,16 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
                 throw new IOException("Lark's wiki listing is missing its items.");
             foreach (var n in items)
             {
-                if (n == null || (string?)n["node_token"] is not { Length: > 0 } nt
-                    || (string?)n["obj_token"] is not { Length: > 0 } obj
-                    || (string?)n["obj_type"] is not { Length: > 0 } type
-                    || (bool?)n["has_child"] is not bool hasChild)
-                    throw new IOException("Lark returned an incomplete wiki entry.");
-                outList.Add(new WikiNode(nt, obj, type, (string?)n["title"] ?? "Untitled",
+                if (n == null || Str(n["node_token"]) is not { Length: > 0 } nt
+                    || Str(n["obj_token"]) is not { Length: > 0 } obj
+                    || Str(n["obj_type"]) is not { Length: > 0 } type
+                    || n["has_child"] is not JsonValue hc || !hc.TryGetValue<bool>(out var hasChild))
+                {
+                    outList.Incomplete = true;
+                    Skipped("wiki space " + spaceId, n);
+                    continue;
+                }
+                outList.Add(new WikiNode(nt, obj, type, Str(n["title"]) ?? "Untitled",
                     hasChild, n["obj_edit_time"]?.ToString() ?? ""));
             }
             page = NextListingPage(d, seen);

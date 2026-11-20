@@ -293,8 +293,7 @@ public sealed class PairRunner : IDisposable
                         manual = full && _manual;
                         if (!quickFirst)
                         {
-                            _fullRequested = _restore = _retryFailed = _manual = false;
-                            _approvedDeletes = null;
+                            _fullRequested = _restore = _retryFailed = _manual = false;   // (the approval is dropped only once a full pass used it)
                         }
                         if (full) _fullPaused = false;
                     }
@@ -319,6 +318,9 @@ public sealed class PairRunner : IDisposable
                 try { res = _engine!.Run(approvedDeletes: approval, changed: full ? null : changed, shouldYield: yield); }
                 finally { _showProgress = false; }
                 var took = DateTime.UtcNow - t0;
+                // A full pass either applied the approval or saw the deletions changed and asked for a fresh review;
+                // an exception or a quick pass leaves it in place for the next full pass. (A newer approval stays.)
+                if (res.Full && approval != null) lock (_lock) { if (_approvedDeletes == approval) _approvedDeletes = null; }
                 failures = 0;
                 _signInWarned = false;
                 if (res.Interrupted)
@@ -329,7 +331,8 @@ public sealed class PairRunner : IDisposable
                 AfterPass(res, took);
             }
             catch (Exception) when (_stop) { break; }
-            catch (NeedLoginException ex)
+            // Work done in parallel wraps the sign-in error in an AggregateException; treat it the same.
+            catch (Exception ex) when (ex is NeedLoginException || ex is AggregateException agl && agl.Flatten().InnerExceptions.Any(i => i is NeedLoginException))
             {
                 Log.Warn($"{Pair.Label}: {ex.Message}");
                 SetStatus(SyncState.Error, "Sign in to Lark again to keep syncing");
@@ -556,14 +559,19 @@ public sealed class PairRunner : IDisposable
         _shutdown.Cancel();
         _wake.Set();
         _maintWake.Set();
-        if (_thread.IsAlive) _thread.Join();
         _root?.StopFetches();
-        if (_maintThread.IsAlive) _maintThread.Join();
+        // One ~10 s budget for the whole shutdown: this can run on the UI thread, so a stuck operation must not freeze it.
+        var budget = System.Diagnostics.Stopwatch.StartNew();
+        TimeSpan Left() => TimeSpan.FromSeconds(Math.Max(0, 10 - budget.Elapsed.TotalSeconds));
+        var syncDone = !_thread.IsAlive || _thread.Join(Left());
+        var maintDone = !_maintThread.IsAlive || _maintThread.Join(Left());
+        if (!syncDone || !maintDone) Log.Warn($"{Pair.Label}: stopping took too long; carrying on without waiting for the sync loop");
         _watch?.Dispose();
         _attrWatch?.Dispose();
-        _root?.Dispose();
+        _root?.Dispose(Left());
         SaveOpened();
-        _state?.Dispose();
-        _shutdown.Dispose();
+        // A loop that's still running keeps using these; they're left to the process exit instead of pulled from under it.
+        if (syncDone) _state?.Dispose();
+        if (syncDone && maintDone) _shutdown.Dispose();
     }
 }

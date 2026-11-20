@@ -266,40 +266,94 @@ public sealed class CfLocal : ICloudLocal
         return Stat(rel) ?? current;
     }
 
-    public LocalItem? MarkUploaded(string rel, string token, string snapshot)
+    /// <summary>Upload copies live in a hidden ".lcs-*" folder inside the synced folder: same drive (a big upload can't fill C:),
+    /// and the ignore rules keep it out of every scan and every sync.</summary>
+    public string SnapshotDir => Path.Combine(Root, ".lcs-upload");
+
+    public void CleanSnapshots()
+    {
+        var dir = SnapshotDir;
+        Directory.CreateDirectory(dir);
+        File.SetAttributes(dir, FileAttributes.Directory | FileAttributes.Hidden);
+        foreach (var f in Directory.EnumerateFiles(dir, ".lcs-*"))
+            try { File.Delete(f); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+    }
+
+    public LocalItem? MarkUploaded(string rel, string token, long size, string hash)
     {
         var full = FullPath(rel);
         LocalItem? uploaded = null;
         Writable(full, () =>
         {
-            // Read and mark through the same exclusive handle so a save cannot replace the verified bytes.
-            using var file = new FileStream(full, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
-            var handle = file.SafeFileHandle;
-            var attrs = (uint)File.GetAttributes(handle);
-            if ((attrs & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_OFFLINE)) != 0) return;
-            using var copy = File.OpenRead(snapshot);
-            if (file.Length != copy.Length || !System.Security.Cryptography.SHA256.HashData(file).AsSpan()
-                    .SequenceEqual(System.Security.Cryptography.SHA256.HashData(copy))) return;
-            var current = new LocalItem
-            {
-                Path = rel, Size = file.Length, MTime = File.GetLastWriteTimeUtc(handle).Ticks,
-                IsPlaceholder = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 && ReadPlaceholderInfo(handle).IsPlaceholder,
-            };
-            MarkSynced(handle.DangerousGetHandle(), current, token);
-            uploaded = current;
+            try { uploaded = MarkUploadedExclusive(full, rel, token, size, hash); }
+            // Open in another app (Word, Excel…) that allows sharing: verify without locking it out.
+            catch (IOException ex) when ((ex.HResult & 0xFFFF) is 32 or 33) { uploaded = MarkUploadedShared(full, rel, token, size, hash); }
         });
         _cache.TryRemove(rel, out _);
         return uploaded;
     }
 
-    static void MarkSynced(IntPtr handle, LocalItem current, string token)
+    static bool SameAsUploaded(FileStream file, long size, string hash) =>
+        file.Length == size && Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(file)) == hash;
+
+    static LocalItem? MarkUploadedExclusive(string full, string rel, string token, long size, string hash)
+    {
+        // Read and mark through the same exclusive handle so a save cannot replace the verified bytes.
+        using var file = new FileStream(full, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        var handle = file.SafeFileHandle;
+        var attrs = (uint)File.GetAttributes(handle);
+        if ((attrs & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_OFFLINE)) != 0) return null;
+        if (!SameAsUploaded(file, size, hash)) return null;
+        var current = new LocalItem
+        {
+            Path = rel, Size = file.Length, MTime = File.GetLastWriteTimeUtc(handle).Ticks,
+            IsPlaceholder = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 && ReadPlaceholderInfo(handle).IsPlaceholder,
+        };
+        MarkSynced(handle.DangerousGetHandle(), current, token);
+        return current;
+    }
+
+    /// <summary>The file is open in another app, so it can't be locked. The marking handle asks only for WRITE_DAC (which share
+    /// modes don't govern) and the bytes are read through a second, sharing handle. Three guards keep us from marking bytes we
+    /// didn't upload: size/time are noted before and compared after hashing, the baseline gets the time noted BEFORE hashing (a
+    /// later write then shows as a change at the next scan), and Windows only applies the mark if the file's USN is still the
+    /// one read before hashing. Anything doubtful returns null / throws and the mark is retried on a later pass.</summary>
+    static LocalItem? MarkUploadedShared(string full, string rel, string token, long size0, string hash)
+    {
+        using var mark = CreateFile(Long(full), WRITE_DAC | FILE_READ_ATTRIBUTES, FILE_SHARE_ALL, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+        if (mark.IsInvalid) throw new IOException($"Couldn't open {rel} to mark it as synced (error {Marshal.GetLastWin32Error()})");
+        var usn = ReadUsn(mark);
+        if (usn == 0) return null;                                  // no change journal: nothing to guard with
+        using var file = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        var handle = file.SafeFileHandle;
+        var attrs = (uint)File.GetAttributes(handle);
+        if ((attrs & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_OFFLINE)) != 0) return null;
+        var (size, mtime) = (file.Length, File.GetLastWriteTimeUtc(handle).Ticks);
+        if (!SameAsUploaded(file, size0, hash)) return null;
+        if (file.Length != size || File.GetLastWriteTimeUtc(handle).Ticks != mtime) return null;     // written while hashing
+        var current = new LocalItem
+        {
+            Path = rel, Size = size, MTime = mtime,
+            IsPlaceholder = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 && ReadPlaceholderInfo(handle).IsPlaceholder,
+        };
+        var usnPtr = Marshal.AllocHGlobal(8);
+        try
+        {
+            Marshal.WriteInt64(usnPtr, usn);
+            MarkSynced(mark.DangerousGetHandle(), current, token, usnPtr);     // refused if the USN moved on
+        }
+        finally { Marshal.FreeHGlobal(usnPtr); }
+        return current;
+    }
+
+    static void MarkSynced(IntPtr handle, LocalItem current, string token, IntPtr usn = default)
     {
         var id = Encoding.UTF8.GetBytes(token);
         if (!current.IsPlaceholder)
-            Check(CfConvertToPlaceholder(handle, id, (uint)id.Length, CF_CONVERT_FLAG_MARK_IN_SYNC, IntPtr.Zero, IntPtr.Zero), "Linking the file to Lark");
+            Check(CfConvertToPlaceholder(handle, id, (uint)id.Length, CF_CONVERT_FLAG_MARK_IN_SYNC, usn, IntPtr.Zero), "Linking the file to Lark");
         else
             Check(CfUpdatePlaceholder(handle, IntPtr.Zero, id, (uint)id.Length, IntPtr.Zero, 0,
-                CF_UPDATE_FLAG_MARK_IN_SYNC | (current.IsDir ? CF_UPDATE_FLAG_DISABLE_ON_DEMAND_POPULATION : 0), IntPtr.Zero, IntPtr.Zero),
+                CF_UPDATE_FLAG_MARK_IN_SYNC | (current.IsDir ? CF_UPDATE_FLAG_DISABLE_ON_DEMAND_POPULATION : 0), usn, IntPtr.Zero),
                 "Marking the file as synced");
     }
 
@@ -327,16 +381,19 @@ public sealed class CfLocal : ICloudLocal
         var full = FullPath(rel);
         if (Directory.Exists(full))
         {
-            if (recycle) Recycle(full, true);
+            if (recycle) Recycle(full, true, true);
             else Directory.Delete(full, recursive: false);
         }
         else if (File.Exists(full))
         {
+            // Only a copy Lark still has (in sync, or never downloaded) may skip the Recycle Bin: edits made here must stay recoverable.
+            var st = recycle ? Stat(rel) : null;
+            var inLarkTrash = st != null && (st.InSync || !st.OnDisk);
             var attrs = File.GetAttributes(full);
             File.SetAttributes(full, attrs & ~FileAttributes.ReadOnly);
             try
             {
-                if (recycle) Recycle(full, false);
+                if (recycle) Recycle(full, false, inLarkTrash);
                 else File.Delete(full);
             }
             catch
@@ -348,19 +405,38 @@ public sealed class CfLocal : ICloudLocal
         _cache.TryRemove(rel, out _);
     }
 
-    static void Recycle(string full, bool isDir)
+    static readonly object RecycleLock = new();
+
+    static void Recycle(string full, bool isDir, bool canDeleteForGood)
     {
-        try
+        // Direct shell call with no UI at all (the VB helper can still show error boxes, and this runs on a background thread).
+        var op = new SHFILEOPSTRUCT
         {
-            if (isDir)
-                Microsoft.VisualBasic.FileIO.FileSystem.DeleteDirectory(full, Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs, Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
-            else
-                Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(full, Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs, Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
-        }
-        catch (Exception ex)
+            wFunc = FO_DELETE, pFrom = full + "\0",
+            fFlags = (ushort)(FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT | FOF_NOCONFIRMMKDIR),
+        };
+        int rc;
+        // (deletes run several at a time; the shell's file operation is taken one at a time)
+        try { lock (RecycleLock) rc = SHFileOperationW(ref op); }
+        catch (Exception ex) { rc = -1; Log.Warn($"Recycle Bin call failed for {Path.GetFileName(full)}: {ex.Message}"); }
+        var exists = isDir ? Directory.Exists(full) : File.Exists(full);
+        if (!exists) return;
+        if (rc == 0 && !op.fAnyOperationsAborted) return;
+        // The Recycle Bin couldn't take it (turned off, full, file too big, path too long). Unless something else is using the
+        // item – then it's left alone and retried later – it's deleted for good, because it was deleted in Lark.
+        if (!canDeleteForGood)
+            throw new IOException("The Recycle Bin couldn't take this file and it has changes made on this PC, so it was left here.");
+        if (!isDir)
         {
-            throw new IOException("Couldn't move this item to the Recycle Bin. It was left on this PC.", ex);
+            try { using var probe = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.None); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                throw new IOException("Couldn't move this item to the Recycle Bin because it's in use. It was left on this PC.", ex);
+            }
         }
+        Log.Warn($"The Recycle Bin couldn't take {Path.GetFileName(full)} (code {rc}); deleting it permanently");
+        if (isDir) Directory.Delete(full, recursive: false);        // never a populated folder: that stays for the next check
+        else File.Delete(full);
     }
 
     /// <summary>"Free up space": drop the local copy; the file stays visible and comes back when opened.</summary>

@@ -23,14 +23,19 @@ public interface ICloudLocal
     void UpdateFilePlaceholder(string rel, string token, long size, DateTime mtimeUtc);
     /// <summary>After uploading a file or creating a folder in Lark: link it to `token` and mark it in sync.</summary>
     LocalItem MarkSynced(string rel, string token);
-    LocalItem? MarkUploaded(string rel, string token, string snapshot)
+    /// <summary>After uploading: if the file on the PC still has the uploaded content (`size` bytes, SHA-256 `hash` in hex,
+    /// both taken while the snapshot was made), link it to `token` and mark it in sync; else null (it changed meanwhile).
+    /// The snapshot is never re-read: only the live file is hashed.</summary>
+    LocalItem? MarkUploaded(string rel, string token, long size, string hash)
     {
-        using var copy = File.OpenRead(snapshot);
         using var current = OpenForUpload(rel);
-        return System.Security.Cryptography.SHA256.HashData(copy).AsSpan()
-            .SequenceEqual(System.Security.Cryptography.SHA256.HashData(current))
-            ? MarkSynced(rel, token) : null;
+        return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(current)) == hash ? MarkSynced(rel, token) : null;
     }
+    /// <summary>Where copies being uploaded are kept. Should be on the synced folder's drive (a big upload mustn't fill C:)
+    /// and its files must be named ".lcs-*" so they are never synced.</summary>
+    string SnapshotDir => Path.GetTempPath();
+    /// <summary>Remove snapshots left behind by an earlier run that was stopped mid-upload.</summary>
+    void CleanSnapshots() { }
     void Move(string from, string to);
     /// <summary>Delete; `recycle` sends it to the Recycle Bin.</summary>
     void Delete(string rel, bool recycle);

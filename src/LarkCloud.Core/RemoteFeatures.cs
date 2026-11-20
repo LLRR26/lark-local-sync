@@ -88,7 +88,13 @@ public sealed class RemoteFeatures : IRemoteDrive
         if (SpecialTokens.IsCopy(token)) return ExportNow(token, CancellationToken.None).Size;
         if (SpecialTokens.IsZip(token))
         {
-            using var z = OpenZip(token, CancellationToken.None, out _);
+            // Our zips hold one file and its size is in the first header: read 30 bytes, not the whole zip.
+            var head = new byte[30];
+            using (var s = _inner.OpenRead(SpecialTokens.Raw(token), 0, CancellationToken.None))
+                if (s.ReadAtLeast(head, 30, throwOnEndOfStream: false) == 30 && BitConverter.ToUInt32(head, 0) == 0x04034b50
+                    && (BitConverter.ToUInt16(head, 6) & 8) == 0 && BitConverter.ToUInt32(head, 22) is var size and not 0xFFFFFFFF)
+                    return size;
+            using var z = OpenZip(token, CancellationToken.None, out _);             // sizes after the data, or zip64
             return z.Length;
         }
         return _inner.ProbeSize(token);

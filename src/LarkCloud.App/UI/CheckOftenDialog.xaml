@@ -12,7 +12,7 @@
 
         <StackPanel Margin="32,28,32,12">
             <TextBlock x:Name="Heading" Style="{StaticResource SubtitleText}"/>
-            <TextBlock Text="Changes made in Lark to these folders, and the folders inside them, show up here within about half a minute. Everything else is checked every few minutes."
+            <TextBlock Text="New files, edits and renames made in Lark in these folders, and the folders inside them, show up here within about half a minute. Deletions, and everything else, are picked up by the normal check every few minutes."
                        Style="{StaticResource BodyText}" Margin="0,12,0,0"/>
         </StackPanel>
 

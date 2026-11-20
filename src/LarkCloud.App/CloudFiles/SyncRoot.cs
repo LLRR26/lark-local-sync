@@ -23,7 +23,7 @@ public sealed class SyncRoot : IDisposable
     GCHandle _self;
     bool _connected;
     readonly object _fetchLock = new();
-    readonly Dictionary<CancellationTokenSource, (long Transfer, long Request)> _fetches = new();
+    readonly Dictionary<CancellationTokenSource, (long Transfer, long Offset, long Length)> _fetches = new();
     bool _stopping;
 
     /// <summary>Raised when an opened file's size in Lark no longer matches the placeholder (Lark changed it): sync now.</summary>
@@ -141,12 +141,22 @@ public sealed class SyncRoot : IDisposable
         Log.Info($"Connected “{_pair.LocalFolder}”: files are downloaded from Lark when opened");
     }
 
-    public void Dispose()
+    public void Dispose() => Dispose(TimeSpan.FromSeconds(10));
+
+    /// <summary>Cancels the running downloads and waits up to `wait` for them to end. A download that won't stop is left behind:
+    /// disconnecting makes its remaining CfExecute calls fail, which ends it, and Windows fails the open file's read.</summary>
+    public void Dispose(TimeSpan wait)
     {
         if (!_connected) return;
         StopFetches();
+        var until = DateTime.UtcNow + wait;
         lock (_fetchLock)
-            while (_fetches.Count > 0) Monitor.Wait(_fetchLock);
+            while (_fetches.Count > 0)
+            {
+                var left = until - DateTime.UtcNow;
+                if (left <= TimeSpan.Zero) { Log.Warn($"{_fetches.Count} download(s) didn't stop in time; disconnecting anyway"); break; }
+                Monitor.Wait(_fetchLock, left);
+            }
         CfDisconnectSyncRoot(_connectionKey);
         _connected = false;
         if (_self.IsAllocated) _self.Free();
@@ -184,7 +194,7 @@ public sealed class SyncRoot : IDisposable
             if (!root._stopping)
             {
                 var cts = new CancellationTokenSource();
-                root._fetches.Add(cts, (tk, rk));
+                root._fetches.Add(cts, (tk, offset, length));
                 _ = Task.Run(() =>
                 {
                     try { root.Transfer(ck, tk, rk, token, path, offset, length, size, cts.Token); }
@@ -210,14 +220,31 @@ public sealed class SyncRoot : IDisposable
         try
         {
             var info = Marshal.PtrToStructure<CF_CALLBACK_INFO>(infoPtr);
-            if (info.StructSize < 152) info.RequestKey = 0;
+            // The RequestKey of a cancel callback isn't the fetch's (it names the cancel request), so the fetch is found by
+            // TransferKey, and the cancelled range (Cancel.FetchData) tells which of several fetches of one file it is.
+            long off = 0, len = -1;
+            try
+            {
+                off = Marshal.ReadInt64(paramsPtr, PARAM_FETCH_REQUIRED_OFFSET);
+                len = Marshal.ReadInt64(paramsPtr, PARAM_FETCH_REQUIRED_LENGTH);
+            }
+            catch { }                                            // unreadable: treat as "all of it"
             if (GCHandle.FromIntPtr(info.CallbackContext).Target is SyncRoot root)
                 lock (root._fetchLock)
-                    foreach (var (cts, key) in root._fetches)
-                        if (key.Transfer == info.TransferKey && (info.RequestKey == 0 || key.Request == info.RequestKey))
+                    foreach (var (cts, f) in root._fetches)
+                        if (f.Transfer == info.TransferKey && Overlaps(f.Offset, f.Length, off, len))
                             cts.Cancel();
         }
         catch { }
+    }
+
+    /// <summary>Do [a, a+alen) and [b, b+blen) share bytes? A negative length (CF_EOF) runs to the end of the file; unknown (0) counts as overlapping.</summary>
+    static bool Overlaps(long a, long alen, long b, long blen)
+    {
+        if (alen == 0 || blen == 0) return true;
+        var aEnd = alen < 0 ? long.MaxValue : a + alen;
+        var bEnd = blen < 0 ? long.MaxValue : b + blen;
+        return a < bEnd && b < aEnd;
     }
 
     static byte[] CopyBytes(IntPtr p, int n)

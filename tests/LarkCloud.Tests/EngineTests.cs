@@ -688,6 +688,70 @@ public class EngineTests
     }
 
     [Fact]
+    public void Editing_uploads_under_the_real_Lark_name_not_the_PC_name()
+    {
+        using var e = new Env();
+        e.Remote.AddFile("Q1: Plan?.txt", B("q"));
+        e.Remote.AddFile("Report.xlsx", B("first"));
+        e.Remote.AddFile("Report.xlsx", B("second!"));
+        e.Sync();
+        e.Local.UserOpen("Q1： Plan？.txt");
+        e.Local.UserWrite("Q1： Plan？.txt", B("edited"));
+        e.Local.UserOpen("Report (2).xlsx");
+        e.Local.UserWrite("Report (2).xlsx", B("second, edited"));
+        e.Sync();
+        var names = e.Remote.Calls.Where(c => c.Op == "upload").Select(c => c.Arg).ToList();
+        Assert.Contains("Q1: Plan?.txt", names);
+        Assert.Contains("Report.xlsx", names);
+        Assert.DoesNotContain("Q1： Plan？.txt", names);
+        Assert.DoesNotContain("Report (2).xlsx", names);
+    }
+
+    [Fact]
+    public void Editing_a_zipped_file_uploads_with_exactly_one_zip_suffix()
+    {
+        using var e = new Env();
+        e.Remote.UploadFilter = (name, content) => !name.EndsWith(".zip") && content.Contains("${") ? new LarkApiException(403, "Forbidden") : null;
+        e.Local.UserWrite("typekit.js", B("var x = `${y}`;"));
+        e.Sync();
+        e.Local.UserWrite("typekit.js", B("var x = `${z}`; // v2"));
+        e.Sync();
+        var zips = e.Remote.Calls.Where(c => c.Op == "upload" && c.Arg.EndsWith(".zip")).Select(c => c.Arg).ToList();
+        Assert.Equal(2, zips.Count);
+        Assert.All(zips, z => Assert.Equal("typekit.js (zipped).zip", z));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void A_move_on_the_PC_whose_Lark_recheck_fails_ends_the_pass_without_deleting_anything(bool folder)
+    {
+        using var e = new Env();
+        e.Remote.AddFile("Docs/a.txt", B("a"));
+        e.Remote.AddFolder("sub");
+        e.Sync();
+        e.AssertSettled();
+        var armed = false;
+        e.Remote.MutationHook = () => armed = true;
+        e.Remote.ListFault = _ => armed ? new HttpRequestException("offline") : null;
+        string oldPath, newPath;
+        if (folder) { e.Local.UserMove("Docs", "Docs2"); oldPath = "Docs"; newPath = "Docs2/a.txt"; }
+        else { e.Local.UserMove("Docs/a.txt", "sub/a.txt"); oldPath = "Docs/a.txt"; newPath = "sub/a.txt"; }
+        Assert.ThrowsAny<Exception>(() => e.Sync());          // (may arrive wrapped in an AggregateException; PairRunner copes with both)
+        Assert.Empty(e.Local.Deleted);
+        Assert.Contains(newPath, e.Local.Paths());
+        Assert.DoesNotContain(oldPath, e.Local.Paths());
+        // back online: it settles, moved in Lark, one copy on the PC
+        e.Remote.ListFault = null;
+        e.Engine.Index.Invalidate();
+        e.Sync();
+        e.AssertSettled();
+        Assert.Contains(newPath, e.Remote.Paths());
+        Assert.DoesNotContain("Docs/a.txt", e.Remote.Paths());
+        Assert.Single(e.Local.Paths().Where(p => p.EndsWith("a.txt")));
+    }
+
+    [Fact]
     public void Blocked_files_are_stored_zipped_and_show_as_the_normal_file()
     {
         using var e = new Env();

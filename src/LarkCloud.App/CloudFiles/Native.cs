@@ -235,6 +235,41 @@ internal static class Native
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true, EntryPoint = "CreateFileW")]
     public static extern SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
 
+    // Shell delete to the Recycle Bin with every prompt / error box off (this runs on background threads).
+    public const uint FO_DELETE = 3;
+    public const ushort FOF_SILENT = 0x4, FOF_NOCONFIRMATION = 0x10, FOF_ALLOWUNDO = 0x40, FOF_NOERRORUI = 0x400, FOF_NOCONFIRMMKDIR = 0x200;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct SHFILEOPSTRUCT
+    {
+        public IntPtr hwnd;
+        public uint wFunc;
+        public string pFrom;                  // double-NUL terminated
+        public string? pTo;
+        public ushort fFlags;
+        public bool fAnyOperationsAborted;
+        public IntPtr hNameMappings;
+        public string? lpszProgressTitle;
+    }
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    public static extern int SHFileOperationW(ref SHFILEOPSTRUCT op);
+
+    public const uint WRITE_DAC = 0x40000;                // enough for the Cloud Files calls, and not subject to other apps' share modes
+    public const uint FSCTL_READ_FILE_USN_DATA = 0x900EB;
+
+    [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
+    public static extern bool DeviceIoControl(SafeFileHandle h, uint code, byte[]? inBuf, int inLen, byte[] outBuf, int outLen, out int returned, IntPtr overlapped);
+
+    /// <summary>The file's current USN (changes whenever the file is modified), or 0 if the volume can't tell.</summary>
+    public static long ReadUsn(SafeFileHandle h)
+    {
+        var input = new byte[] { 2, 0, 2, 0 };            // USN_RECORD_V2 only: MinMajorVersion = MaxMajorVersion = 2
+        var buf = new byte[128];
+        return DeviceIoControl(h, FSCTL_READ_FILE_USN_DATA, input, input.Length, buf, buf.Length, out var n, IntPtr.Zero) && n >= 32
+            ? BitConverter.ToInt64(buf, 24) : 0;
+    }
+
     public const uint FILE_READ_ATTRIBUTES = 0x80;
     public const uint GENERIC_READ = 0x80000000;
     public const uint FILE_SHARE_ALL = 7;
