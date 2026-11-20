@@ -16,6 +16,7 @@ public sealed class SyncService : IDisposable
     public Config Config { get; }
     public LarkAuth Auth { get; }
     public HttpClient Http { get; }
+    readonly LarkRequestLimiter _requestLimiter = new();
     readonly Dictionary<string, PairRunner> _runners = new();
     readonly object _lock = new();
     public event Action? StatusChanged;
@@ -41,9 +42,11 @@ public sealed class SyncService : IDisposable
         foreach (var p in Config.GetPairs()) StartRunner(p);
     }
 
+    internal LarkApi CreateApi() => new(Auth, Http, "", limiter: _requestLimiter);
+
     void StartRunner(Pair p)
     {
-        var r = new PairRunner(p, Config, Auth, Http);
+        var r = new PairRunner(p, Config, Auth, Http, _requestLimiter);
         r.Changed += () => StatusChanged?.Invoke();
         r.NeedsAttention += m => Notify?.Invoke(m);
         r.NeedSignIn += () => NeedSignIn?.Invoke();

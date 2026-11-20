@@ -19,6 +19,7 @@ public sealed class FakeLarkHttp : HttpMessageHandler
     readonly Dictionary<string, (JsonObject Meta, SortedDictionary<int, byte[]> Parts)> _uploads = new();
     public int DevicePolls;
     public Func<HttpResponseMessage?>? TokenHook;          // e.g. simulate DNS failure / 429 on sign-in renewal
+    public Func<string?, HttpResponseMessage?>? ListingHook;
     public int TokenCalls;
     public readonly List<(string Space, string Parent, WikiNode Node)> Wiki = new();
     public bool PermissionAuth = true;                    // members/auth answers "can edit"
@@ -37,6 +38,8 @@ public sealed class FakeLarkHttp : HttpMessageHandler
         var path = req.RequestUri!.AbsolutePath;
         var q = System.Web.HttpUtility.ParseQueryString(req.RequestUri.Query);
         lock (Log) Log.Add($"{req.Method} {path}");
+        if (path == "/open-apis/drive/v1/files" && ListingHook?.Invoke(q["page_token"]) is { } listing)
+            return listing;
 
         // ---------------- accounts
         if (path == "/oauth/v1/device_authorization")
@@ -196,17 +199,29 @@ public sealed class FakeLarkHttp : HttpMessageHandler
 
 public sealed class ApiFixture : IDisposable
 {
+    sealed class ManualClock : TimeProvider
+    {
+        long _ticks;
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+        public override long GetTimestamp() => Interlocked.Read(ref _ticks);
+        public void Advance(TimeSpan delay) => Interlocked.Add(ref _ticks, delay.Ticks);
+    }
+
     public readonly FakeLarkHttp Http = new();
     public readonly LarkAuth Auth;
     public readonly LarkApi Api;
+    readonly ManualClock _clock = new();
+    readonly LarkRequestLimiter _limiter;
+    readonly HttpClient _client;
     readonly string _dir = Path.Combine(Path.GetTempPath(), "lcs-api-" + Guid.NewGuid().ToString("N"));
 
     public ApiFixture(bool signIn = true)
     {
         Directory.CreateDirectory(_dir);
         var cfg = new Config { AppId = "cli_x", AppSecret = "secret" };
-        var client = new HttpClient(Http);
-        Auth = new LarkAuth(cfg, new TokenStore(new PlainProtector(), Path.Combine(_dir, "token.dat")), client);
+        _client = new HttpClient(Http);
+        _limiter = new LarkRequestLimiter(0, _clock);
+        Auth = new LarkAuth(cfg, new TokenStore(new PlainProtector(), Path.Combine(_dir, "token.dat")), _client);
         if (signIn)
         {
             Task.Run(async () =>
@@ -215,14 +230,111 @@ public sealed class ApiFixture : IDisposable
                 await Auth.PollDeviceFlowAsync(flow with { Interval = 0 }, CancellationToken.None);
             }).GetAwaiter().GetResult();
         }
-        Api = new LarkApi(Auth, client, "", 0) { Sleep = _ => { } };
+        Api = CreateApi("");
     }
 
-    public void Dispose() { try { Directory.Delete(_dir, true); } catch { } }
+    public TimeSpan Elapsed => TimeSpan.FromTicks(_clock.GetTimestamp());
+    public LarkApi CreateApi(string root) => new(Auth, _client, root, limiter: _limiter) { Sleep = _clock.Advance };
+
+    public void Dispose() { _client.Dispose(); try { Directory.Delete(_dir, true); } catch { } }
 }
 
 public class ApiTests
 {
+    [Fact]
+    public void Retry_after_pauses_requests_from_another_client()
+    {
+        using var f = new ApiFixture();
+        var other = f.CreateApi(f.Api.RootToken);
+        TimeSpan? otherRequestAt = null;
+        var attempts = 0;
+        f.Http.ListingHook = _ =>
+        {
+            if (++attempts == 1)
+            {
+                var response = new HttpResponseMessage(HttpStatusCode.TooManyRequests);
+                response.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromSeconds(4));
+                return response;
+            }
+            if (attempts == 2) otherRequestAt = f.Elapsed;
+            return null;
+        };
+
+        var queuedOther = false;
+        var wait = f.Api.Sleep!;
+        f.Api.Sleep = delay =>
+        {
+            if (queuedOther) { wait(delay); return; }
+            queuedOther = true;
+            other.ListFolder(other.RootToken);
+        };
+
+        f.Api.ListFolder(f.Api.RootToken);
+        Assert.Equal(TimeSpan.FromSeconds(4), otherRequestAt);
+        Assert.Equal(3, attempts);
+        Assert.Equal(1, f.Api.RateLimitHits);
+        Assert.Equal(0, other.RateLimitHits);
+    }
+    [Theory]
+    [InlineData("<html>Unexpected response</html>")]
+    [InlineData("""{"code":0,"data":{"has_more":false}}""")]
+    [InlineData("""{"code":0,"data":{"files":[],"has_more":true}}""")]
+    [InlineData("""{"code":0,"data":{"files":[],"has_more":true,"next_page_token":"repeat"}}""")]
+    public void Invalid_listing_leaves_previous_inventory_and_local_files_intact(string response)
+    {
+        using var f = new ApiFixture();
+        using var env = new Env(inner: f.Api);
+        for (var i = 0; i < 3; i++) f.Http.R.AddFile($"file{i}.txt", new byte[] { 1 });
+        env.Sync();
+        f.Http.ListingHook = page => page == null ? null : new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(response, Encoding.UTF8, "application/json"),
+        };
+
+        var failure = Assert.Throws<AggregateException>(() => env.Sync());
+        Assert.Contains(failure.Flatten().InnerExceptions, ex => ex is IOException);
+        Assert.Equal(3, env.Engine.Index.Entries().Count);
+        Assert.Equal(3, env.State.Count);
+        Assert.Equal(3, env.Local.Paths().Count);
+        Assert.Empty(env.Local.Deleted);
+    }
+
+    [Fact]
+    public void Invalid_wiki_listing_is_not_an_empty_folder()
+    {
+        using var f = new ApiFixture();
+        f.Http.Wiki.Add(("1", "", new WikiNode("", "obj", "file", "Broken node", false, "0")));
+        Assert.Throws<IOException>(() => f.Api.WikiNodes("1", null));
+    }
+
+    [Fact]
+    public void Failed_database_commit_can_be_retried_with_newer_changes()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"lcs-state-{Guid.NewGuid():N}.db");
+        try
+        {
+            using var state = new StateDb(path);
+            using var connection = new Microsoft.Data.Sqlite.SqliteConnection(
+                new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder { DataSource = path, Pooling = false }.ToString());
+            connection.Open();
+            using var sql = connection.CreateCommand();
+            sql.CommandText = "CREATE TRIGGER fail_entry BEFORE INSERT ON entries BEGIN SELECT RAISE(ABORT, 'write failed'); END";
+            sql.ExecuteNonQuery();
+            state.Put(new BaseEntry { Path = "keep.txt", Size = 1 });
+            state.Put(new BaseEntry { Path = "change.txt", Size = 2 });
+            Assert.Throws<Microsoft.Data.Sqlite.SqliteException>(state.Commit);
+
+            state.Put(new BaseEntry { Path = "change.txt", Size = 3 });
+            sql.CommandText = "DROP TRIGGER fail_entry";
+            sql.ExecuteNonQuery();
+            state.Commit();
+
+            using var reopened = new StateDb(path);
+            Assert.Equal(1L, reopened.Get("keep.txt")?.Size);
+            Assert.Equal(3L, reopened.Get("change.txt")?.Size);
+        }
+        finally { File.Delete(path); }
+    }
     [Fact]
     public void Device_sign_in_saves_a_refreshable_session_with_the_name()
     {

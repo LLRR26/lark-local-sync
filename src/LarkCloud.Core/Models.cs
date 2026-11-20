@@ -64,6 +64,7 @@ public sealed class LocalItem
 /// <summary>What a path looked like on both sides right after it was last synced.</summary>
 public sealed class BaseEntry
 {
+    public const long LocalUploadPending = -1;
     public string Path { get; set; } = "";
     public string Kind { get; set; } = Kinds.File;
     public string? Token { get; set; }
@@ -78,6 +79,7 @@ public sealed class BaseEntry
 
 public sealed class PendingDelete
 {
+    public string? Approval { get; init; }
     public string Path { get; init; } = "";
     public bool InLark { get; init; }                // true: would be deleted in Lark (deleted on the PC); false: on the PC
 }

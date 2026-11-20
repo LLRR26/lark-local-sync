@@ -38,7 +38,7 @@ internal static class FeatureCheck
             catch (Exception ex) { Fail(name, ex, fix, forIt); }
         }
 
-        var api = new LarkApi(svc.Auth, svc.Http, "");
+        var api = svc.CreateApi();
         string root;
         try { root = api.MyFoldersRoot(); Say(new(CheckStatus.Ok, "Sign-in and My Folders", "OK")); }
         catch (Exception ex) { Fail("Sign-in and My Folders", ex); return; }

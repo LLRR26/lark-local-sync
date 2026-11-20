@@ -17,6 +17,7 @@ internal sealed partial class DeletionsDialog : Window
 
     readonly IAppModel _m;
     readonly string _pairId;
+    readonly string? _approval;
     readonly int _here;
     readonly ICollectionView _view;
 
@@ -29,6 +30,7 @@ internal sealed partial class DeletionsDialog : Window
 
         var pair = model.Pairs().FirstOrDefault(p => p.Id == pairId);
         var all = model.StatusOf(pairId).PendingDeletes;
+        _approval = all.FirstOrDefault()?.Approval;
         var inLark = all.Count(d => d.InLark);
         _here = all.Count - inLark;
         var n = all.Count;
@@ -79,7 +81,7 @@ internal sealed partial class DeletionsDialog : Window
 
     void Delete_Click(object sender, RoutedEventArgs e)
     {
-        _m.AllowDeletes(_pairId);
+        if (_approval != null) _m.AllowDeletes(_pairId, _approval);
         Close();
     }
 

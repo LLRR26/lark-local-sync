@@ -174,14 +174,14 @@ internal sealed class TrayApp : IAppModel, IDisposable
     public void RenameFolder(string pairId, string newPath) => _svc.RenamePair(pairId, newPath);
     public void SyncAllNow() => _svc.SyncAllNow();
     void IAppModel.AddFolder() => ShowAddFolder();
-    public IFolderSource OpenFolderSource() => new LarkFolderSource(new LarkApi(_svc.Auth, _svc.Http, ""));
+    public IFolderSource OpenFolderSource() => new LarkFolderSource(_svc.CreateApi());
     public void AddPair(Pair p) => _svc.AddPair(p);
     public void RetryFailed(string? pairId)
     {
         foreach (var p in _svc.Config.GetPairs())
             if (pairId == null || p.Id == pairId) _svc.Runner(p.Id)?.RetryFailed();
     }
-    public void AllowDeletes(string pairId) => _svc.Runner(pairId)?.AllowDeletes();
+    public void AllowDeletes(string pairId, string approval) => _svc.Runner(pairId)?.AllowDeletes(approval);
     public void RestoreDeletes(string pairId) => _svc.Runner(pairId)?.RestoreDeletes();
     public void ShowProblems(string? pairId) => ShowMain(AppPage.Problems, pairId);
     public void ShowDeletions(string pairId) => Ui_(() =>

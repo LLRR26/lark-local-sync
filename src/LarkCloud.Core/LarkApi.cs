@@ -78,27 +78,24 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
     readonly LarkAuth _auth;
     readonly HttpClient _http;
     readonly string _base;
+    readonly CancellationToken _lifetime;
     string _root;
 
-    // Requests are spaced at least _interval apart across all threads. It doubles when Lark says
-    // "slow down" and drifts back while things go well.
-    readonly object _throttle = new();
-    readonly double _baseInterval;
-    double _interval;
-    int _okStreak;
-    DateTime _last = DateTime.MinValue;
+    readonly LarkRequestLimiter _limiter;
     public int RateLimitHits;
     public bool OverwriteSupported = true;
     int _overwriteFailures;
-    public Action<TimeSpan> Sleep = t => Thread.Sleep(t);
+    public Action<TimeSpan>? Sleep;
 
-    public LarkApi(LarkAuth auth, HttpClient http, string rootToken, double minIntervalSeconds = 0.12)
+    public LarkApi(LarkAuth auth, HttpClient http, string rootToken, double minIntervalSeconds = 0.12,
+        CancellationToken lifetime = default, LarkRequestLimiter? limiter = null)
     {
         _auth = auth;
         _http = http;
         _base = auth.OpenBase;
         _root = rootToken;
-        _baseInterval = _interval = minIntervalSeconds;
+        _lifetime = lifetime;
+        _limiter = limiter ?? new LarkRequestLimiter(minIntervalSeconds);
     }
 
     /// <summary>The synced folder's token. "" (My Folders) is looked up once.</summary>
@@ -112,54 +109,45 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
     }
 
     // ------------------------------------------------------------ plumbing
-    void Wait()
+    void Delay(TimeSpan delay, CancellationToken ct)
     {
-        DateTime slot;
-        lock (_throttle)
-        {
-            var now = DateTime.UtcNow;
-            slot = _last.AddSeconds(_interval);
-            if (slot < now) slot = now;
-            _last = slot;
-        }
-        var wait = slot - DateTime.UtcNow;
-        if (wait > TimeSpan.Zero) Sleep(wait);
+        ct.ThrowIfCancellationRequested();
+        if (Sleep != null) Sleep(delay);
+        else Task.Delay(delay, ct).GetAwaiter().GetResult();
     }
 
-    void SlowDown()
+    void SlowDown(HttpResponseMessage response, int attempt)
     {
-        lock (_throttle) { RateLimitHits++; _okStreak = 0; _interval = Math.Min(2.0, Math.Max(_interval * 2, 0.05)); }
+        Interlocked.Increment(ref RateLimitHits);
+        var retryAfter = response.Headers.RetryAfter;
+        var delay = retryAfter?.Delta ?? (retryAfter?.Date - DateTimeOffset.UtcNow);
+        if (delay == null || delay <= TimeSpan.Zero)
+            delay = TimeSpan.FromSeconds(Math.Min(30.0, Math.Pow(2, attempt) + Random.Shared.NextDouble()));
+        _limiter.Throttled(delay.Value);
+        Log.Warn($"Lark API rate limited; pausing new Lark requests for {delay.Value.TotalSeconds:0.0}s");
     }
 
-    void WentWell()
-    {
-        lock (_throttle)
-        {
-            if (++_okStreak >= 20 && _interval > _baseInterval)
-            {
-                _okStreak = 0;
-                _interval = Math.Max(_baseInterval, _interval * 0.75);
-            }
-        }
-    }
-
-    void Backoff(int attempt, string why)
+    void Backoff(int attempt, string why, CancellationToken ct)
     {
         var delay = Math.Min(30.0, Math.Pow(2, attempt) + Random.Shared.NextDouble());
         Log.Warn($"Lark API {why}; retrying in {delay:0.0}s");
-        Sleep(TimeSpan.FromSeconds(delay));
+        Delay(TimeSpan.FromSeconds(delay), ct);
     }
 
     /// <summary>Sends a request (rebuilt for every attempt) and returns the response.
     /// JSON answers with code != 0 become LarkApiException; non-JSON answers are returned when `raw`.</summary>
     HttpResponseMessage Send(Func<HttpRequestMessage> make, string path, bool raw = false, CancellationToken ct = default, int serverErrorTries = 6)
     {
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime);
+        ct = linked.Token;
         var refreshed = false;
         for (var attempt = 0; attempt < 6; attempt++)
         {
-            Wait();
-            var req = make();
-            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _auth.AccessToken());   // may throw LarkUnreachableException
+            ct.ThrowIfCancellationRequested();
+            var token = _auth.AccessToken(ct: ct);
+            _limiter.Wait(Delay, ct);
+            using var req = make();
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
             HttpResponseMessage r;
             try
             {
@@ -168,53 +156,60 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
             catch (HttpRequestException ex)
             {
                 if (attempt == 5) throw new LarkUnreachableException($"Can't reach Lark ({ex.Message})", ex);
-                Backoff(attempt, $"network error: {ex.Message}");
+                Backoff(attempt, $"network error: {ex.Message}", ct);
                 continue;
             }
             catch (TaskCanceledException) when (!ct.IsCancellationRequested)
             {
                 if (attempt == 5) throw;
-                Backoff(attempt, "timed out");
+                Backoff(attempt, "timed out", ct);
                 continue;
             }
             var status = (int)r.StatusCode;
             if (status == 429 || status >= 500)
             {
-                if (status == 429) SlowDown();
-                if (attempt >= (status == 429 ? 5 : serverErrorTries - 1)) throw new LarkApiException(status, r.ReasonPhrase ?? "server error", path);
+                if (status == 429) SlowDown(r, attempt);
+                var error = r.ReasonPhrase ?? "server error";
                 r.Dispose();
-                Backoff(attempt, $"HTTP {status}");
+                if (attempt >= (status == 429 ? 5 : serverErrorTries - 1)) throw new LarkApiException(status, error, path);
+                if (status != 429) Backoff(attempt, $"HTTP {status}", ct);
                 continue;
             }
             var ctype = r.Content.Headers.ContentType?.MediaType ?? "";
             if (raw && status == 416) return r;               // range past the end: the caller reads the size from it
             if (raw && r.IsSuccessStatusCode && !ctype.Contains("json"))
             {
-                WentWell();
+                _limiter.Succeeded();
                 return r;
             }
             var body = ReadJson(r);
             var code = (long?)body["code"] ?? (r.IsSuccessStatusCode ? 0 : status);
             if (code == 0 && r.IsSuccessStatusCode)
             {
-                WentWell();
+                _limiter.Succeeded();
                 r.Content = new StringContent(body.ToJsonString());
                 return r;
             }
             if (TokenErrors.Contains(code) && !refreshed)
             {
                 refreshed = true;
-                _auth.AccessToken(forceRefresh: true);
+                r.Dispose();
+                _auth.AccessToken(forceRefresh: true, ct: ct);
                 attempt--;
                 continue;
             }
-            if (code == RateLimit && attempt < 5)
+            if (code == RateLimit)
             {
-                SlowDown();
-                Backoff(attempt, "rate limited");
-                continue;
+                SlowDown(r, attempt);
+                if (attempt < 5)
+                {
+                    r.Dispose();
+                    continue;
+                }
             }
-            throw new LarkApiException(code, (string?)body["msg"] ?? r.ReasonPhrase ?? "", path);
+            var message = (string?)body["msg"] ?? r.ReasonPhrase ?? "";
+            r.Dispose();
+            throw new LarkApiException(code, message, path);
         }
         throw new LarkApiException(-1, "too many retries", path);
     }
@@ -226,7 +221,7 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
     }
 
     JsonObject Json(HttpMethod method, string path, Dictionary<string, string>? query = null, JsonNode? json = null,
-                    Func<HttpContent>? content = null, int timeoutS = 60, int serverErrorTries = 6)
+                    Func<HttpContent>? content = null, int timeoutS = 60, int serverErrorTries = 6, bool listing = false)
     {
         var url = _base + path + (query == null ? "" : "?" + string.Join("&", query.Select(kv => $"{kv.Key}={Uri.EscapeDataString(kv.Value)}")));
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutS));
@@ -234,7 +229,21 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
         {
             Content = content?.Invoke() ?? (json == null ? null : new StringContent(json.ToJsonString(), Encoding.UTF8, "application/json")),
         }, path, ct: cts.Token, serverErrorTries: serverErrorTries);
-        return ReadJson(r)["data"] as JsonObject ?? new JsonObject();
+        var body = ReadJson(r);
+        if (listing && ((long?)body["code"] != 0 || body["data"] is not JsonObject))
+            throw new IOException("Lark returned an invalid folder listing.");
+        return body["data"] as JsonObject ?? new JsonObject();
+    }
+
+    static string? NextListingPage(JsonObject data, HashSet<string> seen)
+    {
+        if (data["has_more"] is not JsonValue flag || !flag.TryGetValue<bool>(out var more))
+            throw new IOException("Lark's folder listing is missing its pagination status.");
+        if (!more) return null;
+        var next = (string?)data["next_page_token"] ?? (string?)data["page_token"];
+        if (string.IsNullOrWhiteSpace(next) || !seen.Add(next))
+            throw new IOException("Lark returned an incomplete folder listing.");
+        return next;
     }
 
     void WaitTask(string taskId)
@@ -247,7 +256,7 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
             var st = ((string?)(d["result"] ?? d)?["status"] ?? (string?)d["status"] ?? "").ToLowerInvariant();
             if (st == "success") return;
             if (st is "fail" or "failed") throw new LarkApiException(-1, $"async task {taskId} failed", "task_check");
-            Sleep(TimeSpan.FromSeconds(wait));
+            Delay(TimeSpan.FromSeconds(wait), _lifetime);
             wait = Math.Min(2.0, wait * 1.5);
         }
         throw new LarkApiException(-1, $"async task {taskId} timed out", "task_check");
@@ -257,29 +266,33 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
     public List<RemoteEntry> ListFolder(string folderToken)
     {
         var outList = new List<RemoteEntry>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
         string? page = null;
         while (true)
         {
             var q = new Dictionary<string, string> { ["folder_token"] = folderToken, ["page_size"] = "200" };
             if (page != null) q["page_token"] = page;
-            var data = Json(HttpMethod.Get, "/open-apis/drive/v1/files", q);
-            if (data["files"] is JsonArray files)
-                foreach (var f in files)
+            var data = Json(HttpMethod.Get, "/open-apis/drive/v1/files", q, listing: true);
+            if (data["files"] is not JsonArray files)
+                throw new IOException("Lark's folder listing is missing its files.");
+            foreach (var f in files)
+            {
+                var name = (string?)f?["name"];
+                var tok = (string?)f?["token"];
+                var type = (string?)f?["type"];
+                if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(tok) || string.IsNullOrEmpty(type))
+                    throw new IOException("Lark returned an incomplete file entry.");
+                long? size = null;
+                if (f!["size"] is JsonValue sv && long.TryParse(sv.ToString(), out var s)) size = s;
+                outList.Add(new RemoteEntry
                 {
-                    var name = (string?)f?["name"];
-                    var tok = (string?)f?["token"];
-                    if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(tok)) continue;
-                    long? size = null;
-                    if (f!["size"] is JsonValue sv && long.TryParse(sv.ToString(), out var s)) size = s;
-                    outList.Add(new RemoteEntry
-                    {
-                        Path = name, Token = tok, Type = (string?)f["type"] ?? Kinds.File,
-                        MTime = f["modified_time"]?.ToString() ?? "", Size = size,
-                        Url = (string?)f["url"], ParentToken = folderToken,
-                    });
-                }
-            page = (string?)data["next_page_token"] ?? (string?)data["page_token"];
-            if (!((bool?)data["has_more"] ?? false) || string.IsNullOrEmpty(page)) break;
+                    Path = name, Token = tok, Type = type,
+                    MTime = f["modified_time"]?.ToString() ?? "", Size = size,
+                    Url = (string?)f["url"], ParentToken = folderToken,
+                });
+            }
+            page = NextListingPage(data, seen);
+            if (page == null) break;
         }
         return outList;
     }
@@ -325,7 +338,8 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
         long n = 0;
         var buf = new byte[81920];
         int k;
-        while ((k = s.Read(buf, 0, buf.Length)) > 0) n += k;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cts.Token, _lifetime);
+        while ((k = s.ReadAsync(buf.AsMemory(), linked.Token).AsTask().GetAwaiter().GetResult()) > 0) n += k;
         return n;
     }
 
@@ -338,22 +352,26 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
             if (offset > 0) q.Headers.Range = new RangeHeaderValue(offset, null);
             return q;
         }, path, raw: true, ct: ct);
-        var s = r.Content.ReadAsStream(ct);
-        if (offset > 0 && r.StatusCode != HttpStatusCode.PartialContent)
-        {
-            // Range not honoured: skip ahead ourselves.
-            var skip = offset;
-            var buf = new byte[81920];
-            while (skip > 0)
-            {
-                var k = s.Read(buf, 0, (int)Math.Min(buf.Length, skip));
-                if (k <= 0) break;
-                skip -= k;
-            }
-        }
         long? total = r.StatusCode == HttpStatusCode.PartialContent ? r.Content.Headers.ContentRange?.Length
             : r.Content.Headers.ContentLength;
-        return new ResponseStream(s, r) { TotalLength = total };
+        var s = OpenResponseStream(r, ct, total);
+        try
+        {
+            if (offset > 0 && r.StatusCode != HttpStatusCode.PartialContent)
+            {
+                // Range not honoured: skip ahead ourselves.
+                var skip = offset;
+                var buf = new byte[81920];
+                while (skip > 0)
+                {
+                    var k = s.Read(buf, 0, (int)Math.Min(buf.Length, skip));
+                    if (k <= 0) break;
+                    skip -= k;
+                }
+            }
+            return s;
+        }
+        catch { s.Dispose(); throw; }
     }
 
     public void Download(string token, string destPath)
@@ -538,7 +556,7 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
                         long.TryParse(r["file_size"]?.ToString(), out var sz) ? sz : 0);
             if (status is not (1 or 2))
                 throw new LarkApiException(status, (string?)r?["job_error_msg"] is { Length: > 0 } m ? m : $"Lark couldn't export it (status {status})", "export_tasks");
-            Sleep(TimeSpan.FromSeconds(1));
+            Delay(TimeSpan.FromSeconds(1), _lifetime);
         }
         throw new LarkApiException(-1, "Lark took too long to export it", "export_tasks");
     }
@@ -547,7 +565,14 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
     {
         var path = $"/open-apis/drive/v1/export_tasks/file/{exportFileToken}/download";
         var r = Send(() => new HttpRequestMessage(HttpMethod.Get, _base + path), path, raw: true, ct: ct);
-        return new ResponseStream(r.Content.ReadAsStream(ct), r) { TotalLength = r.Content.Headers.ContentLength };
+        return OpenResponseStream(r, ct, r.Content.Headers.ContentLength);
+    }
+
+    ResponseStream OpenResponseStream(HttpResponseMessage response, CancellationToken ct, long? length)
+    {
+        var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime);
+        try { return new ResponseStream(response.Content.ReadAsStream(linked.Token), response, linked) { TotalLength = length }; }
+        catch { linked.Dispose(); response.Dispose(); throw; }
     }
 
     // ------------------------------------------------------------ finding folders shared with you
@@ -592,20 +617,27 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
     public List<WikiNode> WikiNodes(string spaceId, string? parentNode)
     {
         var outList = new List<WikiNode>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
         string? page = null;
         do
         {
             var q = new Dictionary<string, string> { ["page_size"] = "50" };
             if (!string.IsNullOrEmpty(parentNode)) q["parent_node_token"] = parentNode;
             if (page != null) q["page_token"] = page;
-            var d = Json(HttpMethod.Get, $"/open-apis/wiki/v2/spaces/{spaceId}/nodes", q);
-            foreach (var n in d["items"] as JsonArray ?? new JsonArray())
+            var d = Json(HttpMethod.Get, $"/open-apis/wiki/v2/spaces/{spaceId}/nodes", q, listing: true);
+            if (d["items"] is not JsonArray items)
+                throw new IOException("Lark's wiki listing is missing its items.");
+            foreach (var n in items)
             {
-                if (n == null || (string?)n["node_token"] is not { } nt) continue;
-                outList.Add(new WikiNode(nt, (string?)n["obj_token"] ?? "", (string?)n["obj_type"] ?? "", (string?)n["title"] ?? "Untitled",
-                    (bool?)n["has_child"] ?? false, n["obj_edit_time"]?.ToString() ?? ""));
+                if (n == null || (string?)n["node_token"] is not { Length: > 0 } nt
+                    || (string?)n["obj_token"] is not { Length: > 0 } obj
+                    || (string?)n["obj_type"] is not { Length: > 0 } type
+                    || (bool?)n["has_child"] is not bool hasChild)
+                    throw new IOException("Lark returned an incomplete wiki entry.");
+                outList.Add(new WikiNode(nt, obj, type, (string?)n["title"] ?? "Untitled",
+                    hasChild, n["obj_edit_time"]?.ToString() ?? ""));
             }
-            page = ((bool?)d["has_more"] ?? false) ? (string?)d["page_token"] : null;
+            page = NextListingPage(d, seen);
         } while (!string.IsNullOrEmpty(page));
         return outList;
     }
@@ -619,20 +651,22 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
         public long? TotalLength { get; init; }
         readonly Stream _inner;
         readonly HttpResponseMessage _resp;
-        public ResponseStream(Stream inner, HttpResponseMessage resp) { _inner = inner; _resp = resp; }
+        readonly CancellationTokenSource _read;
+        public ResponseStream(Stream inner, HttpResponseMessage resp, CancellationTokenSource read) { _inner = inner; _resp = resp; _read = read; }
         public override bool CanRead => true;
         public override bool CanSeek => false;
         public override bool CanWrite => false;
         public override long Length => throw new NotSupportedException();
         public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
         public override void Flush() { }
-        public override int Read(byte[] buffer, int offset, int count) => _inner.Read(buffer, offset, count);
+        public override int Read(byte[] buffer, int offset, int count) =>
+            _inner.ReadAsync(buffer.AsMemory(offset, count), _read.Token).AsTask().GetAwaiter().GetResult();
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
         public override void SetLength(long value) => throw new NotSupportedException();
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
         protected override void Dispose(bool disposing)
         {
-            if (disposing) { _inner.Dispose(); _resp.Dispose(); }
+            if (disposing) { _inner.Dispose(); _resp.Dispose(); _read.Dispose(); }
             base.Dispose(disposing);
         }
     }

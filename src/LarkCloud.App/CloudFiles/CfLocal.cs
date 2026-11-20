@@ -114,6 +114,11 @@ public sealed class CfLocal : ICloudLocal
     {
         using var h = CreateFile(Long(full), FILE_READ_ATTRIBUTES, FILE_SHARE_ALL, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
         if (h.IsInvalid) return (null, false, true);
+        return ReadPlaceholderInfo(h);
+    }
+
+    static (string? Identity, bool IsPlaceholder, bool InSync) ReadPlaceholderInfo(Microsoft.Win32.SafeHandles.SafeFileHandle h)
+    {
         const int size = 4096 + 64;
         var buf = Marshal.AllocHGlobal(size);
         try
@@ -233,20 +238,51 @@ public sealed class CfLocal : ICloudLocal
     public LocalItem MarkSynced(string rel, string token)
     {
         var full = FullPath(rel);
-        var id = Encoding.UTF8.GetBytes(token);
         var current = Stat(rel) ?? throw new FileNotFoundException(rel);
         Writable(full, () =>
         {
             using var h = new OplockHandle(full, exclusive: false);
-            if (!current.IsPlaceholder)
-                Check(CfConvertToPlaceholder(h.Win32, id, (uint)id.Length, CF_CONVERT_FLAG_MARK_IN_SYNC, IntPtr.Zero, IntPtr.Zero), "Linking the file to Lark");
-            else
-                Check(CfUpdatePlaceholder(h.Win32, IntPtr.Zero, id, (uint)id.Length, IntPtr.Zero, 0,
-                    CF_UPDATE_FLAG_MARK_IN_SYNC | (current.IsDir ? CF_UPDATE_FLAG_DISABLE_ON_DEMAND_POPULATION : 0), IntPtr.Zero, IntPtr.Zero),
-                    "Marking the file as synced");
+            MarkSynced(h.Win32, current, token);
         });
         _cache.TryRemove(rel, out _);
         return Stat(rel) ?? current;
+    }
+
+    public LocalItem? MarkUploaded(string rel, string token, string snapshot)
+    {
+        var full = FullPath(rel);
+        LocalItem? uploaded = null;
+        Writable(full, () =>
+        {
+            // Read and mark through the same exclusive handle so a save cannot replace the verified bytes.
+            using var file = new FileStream(full, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+            var handle = file.SafeFileHandle;
+            var attrs = (uint)File.GetAttributes(handle);
+            if ((attrs & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_OFFLINE)) != 0) return;
+            using var copy = File.OpenRead(snapshot);
+            if (file.Length != copy.Length || !System.Security.Cryptography.SHA256.HashData(file).AsSpan()
+                    .SequenceEqual(System.Security.Cryptography.SHA256.HashData(copy))) return;
+            var current = new LocalItem
+            {
+                Path = rel, Size = file.Length, MTime = File.GetLastWriteTimeUtc(handle).Ticks,
+                IsPlaceholder = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 && ReadPlaceholderInfo(handle).IsPlaceholder,
+            };
+            MarkSynced(handle.DangerousGetHandle(), current, token);
+            uploaded = current;
+        });
+        _cache.TryRemove(rel, out _);
+        return uploaded;
+    }
+
+    static void MarkSynced(IntPtr handle, LocalItem current, string token)
+    {
+        var id = Encoding.UTF8.GetBytes(token);
+        if (!current.IsPlaceholder)
+            Check(CfConvertToPlaceholder(handle, id, (uint)id.Length, CF_CONVERT_FLAG_MARK_IN_SYNC, IntPtr.Zero, IntPtr.Zero), "Linking the file to Lark");
+        else
+            Check(CfUpdatePlaceholder(handle, IntPtr.Zero, id, (uint)id.Length, IntPtr.Zero, 0,
+                CF_UPDATE_FLAG_MARK_IN_SYNC | (current.IsDir ? CF_UPDATE_FLAG_DISABLE_ON_DEMAND_POPULATION : 0), IntPtr.Zero, IntPtr.Zero),
+                "Marking the file as synced");
     }
 
     public void Move(string from, string to)
@@ -273,18 +309,28 @@ public sealed class CfLocal : ICloudLocal
         var full = FullPath(rel);
         if (Directory.Exists(full))
         {
-            if (recycle) TryRecycle(full, true);
+            if (recycle) Recycle(full, true);
             else Directory.Delete(full, recursive: false);
         }
         else if (File.Exists(full))
         {
-            File.SetAttributes(full, File.GetAttributes(full) & ~FileAttributes.ReadOnly);
-            if (!recycle || !TryRecycle(full, false)) File.Delete(full);
+            var attrs = File.GetAttributes(full);
+            File.SetAttributes(full, attrs & ~FileAttributes.ReadOnly);
+            try
+            {
+                if (recycle) Recycle(full, false);
+                else File.Delete(full);
+            }
+            catch
+            {
+                if (File.Exists(full)) File.SetAttributes(full, attrs);
+                throw;
+            }
         }
         _cache.TryRemove(rel, out _);
     }
 
-    static bool TryRecycle(string full, bool isDir)
+    static void Recycle(string full, bool isDir)
     {
         try
         {
@@ -292,12 +338,10 @@ public sealed class CfLocal : ICloudLocal
                 Microsoft.VisualBasic.FileIO.FileSystem.DeleteDirectory(full, Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs, Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
             else
                 Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(full, Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs, Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
-            return true;
         }
         catch (Exception ex)
         {
-            Log.Warn($"Couldn't move {full} to the Recycle Bin ({ex.Message}); deleting it");
-            return false;
+            throw new IOException("Couldn't move this item to the Recycle Bin. It was left on this PC.", ex);
         }
     }
 
@@ -315,6 +359,7 @@ public sealed class CfLocal : ICloudLocal
     /// <summary>Download the file now (for "Always keep on this device").</summary>
     public void Hydrate(string rel, CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         using var h = CreateFile(Long(FullPath(rel)), GENERIC_READ, FILE_SHARE_ALL, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
         if (h.IsInvalid) throw new IOException($"Couldn't open {rel} (error {Marshal.GetLastWin32Error()})");
         Check(CfHydratePlaceholder(h, 0, -1, 0, IntPtr.Zero), "Downloading the file");

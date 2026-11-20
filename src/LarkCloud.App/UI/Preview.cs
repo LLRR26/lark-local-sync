@@ -73,8 +73,8 @@ internal sealed class PreviewModel : IAppModel
             Add("Sample – Site plans", "Sample – Site plans", (p, s) =>
             {
                 s.State = SyncState.Attention; s.Message = "47 deletions are waiting";
-                for (var i = 1; i <= 31; i++) s.PendingDeletes.Add(new PendingDelete { Path = $"Drawings/Level {i % 4}/Sheet {i:00}.dwg", InLark = true });
-                for (var i = 1; i <= 16; i++) s.PendingDeletes.Add(new PendingDelete { Path = $"Photos/2026-0{1 + i % 9}/IMG_{4000 + i}.jpg", InLark = false });
+                for (var i = 1; i <= 31; i++) s.PendingDeletes.Add(new PendingDelete { Path = $"Drawings/Level {i % 4}/Sheet {i:00}.dwg", InLark = true, Approval = "preview" });
+                for (var i = 1; i <= 16; i++) s.PendingDeletes.Add(new PendingDelete { Path = $"Photos/2026-0{1 + i % 9}/IMG_{4000 + i}.jpg", InLark = false, Approval = "preview" });
             });
         Add("Sample – Site photos", "Sample – Site photos", (p, s) =>
         {
@@ -96,7 +96,7 @@ internal sealed class PreviewModel : IAppModel
     public IFolderSource OpenFolderSource() => new FakeSource();
     public void AddPair(Pair p) { _pairs.Add(p); _st[p.Id] = new PairStatus { State = SyncState.Idle, Message = "Up to date" }; }
     public void RetryFailed(string? pairId) { }
-    public void AllowDeletes(string pairId) { _st[pairId].PendingDeletes.Clear(); }
+    public void AllowDeletes(string pairId, string approval) { _st[pairId].PendingDeletes.Clear(); }
     public void RestoreDeletes(string pairId) { _st[pairId].PendingDeletes.Clear(); }
     public void ShowProblems(string? pairId) { }
     public void ShowDeletions(string pairId) { }

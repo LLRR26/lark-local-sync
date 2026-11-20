@@ -432,7 +432,7 @@ public sealed class Env : IDisposable
         Engine.Progress = m => { lock (Progress) Progress.Add(m); };
     }
 
-    public SyncResult Sync(bool allowDeletes = false, IReadOnlyCollection<string>? changed = null) => Engine.Run(allowDeletes, changed);
+    public SyncResult Sync(string? approvedDeletes = null, IReadOnlyCollection<string>? changed = null) => Engine.Run(approvedDeletes, changed);
 
     /// <summary>Another pass changes nothing.</summary>
     public void AssertSettled()

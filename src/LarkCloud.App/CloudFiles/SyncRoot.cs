@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
@@ -23,12 +22,14 @@ public sealed class SyncRoot : IDisposable
     long _connectionKey;
     GCHandle _self;
     bool _connected;
-    readonly ConcurrentDictionary<long, CancellationTokenSource> _fetches = new();
+    readonly object _fetchLock = new();
+    readonly Dictionary<CancellationTokenSource, (long Transfer, long Request)> _fetches = new();
+    bool _stopping;
 
     /// <summary>Raised when an opened file's size in Lark no longer matches the placeholder (Lark changed it): sync now.</summary>
     public event Action? StaleFileOpened;
     public event Action<string, string>? FetchFailed;          // (relative path, message)
-    public int ActiveDownloads => _fetches.Count;
+    public int ActiveDownloads { get { lock (_fetchLock) return _fetches.Count; } }
 
     // Delegates must stay alive for as long as Windows can call them.
     static readonly CF_CALLBACK FetchDataCb = OnFetchData;
@@ -47,7 +48,8 @@ public sealed class SyncRoot : IDisposable
     // ---------------------------------------------------------------- registration
     public static void Register(Pair pair)
     {
-        Directory.CreateDirectory(pair.LocalFolder);
+        if (!Directory.Exists(pair.LocalFolder))
+            throw new DirectoryNotFoundException($"The synced folder “{pair.LocalFolder}” is missing.");
         var id = IdFor(pair.Id);
         try
         {
@@ -142,10 +144,21 @@ public sealed class SyncRoot : IDisposable
     public void Dispose()
     {
         if (!_connected) return;
-        foreach (var c in _fetches.Values) c.Cancel();
+        StopFetches();
+        lock (_fetchLock)
+            while (_fetches.Count > 0) Monitor.Wait(_fetchLock);
         CfDisconnectSyncRoot(_connectionKey);
         _connected = false;
         if (_self.IsAllocated) _self.Free();
+    }
+
+    public void StopFetches()
+    {
+        lock (_fetchLock)
+        {
+            _stopping = true;
+            foreach (var c in _fetches.Keys) c.Cancel();
+        }
     }
 
     // ---------------------------------------------------------------- Windows asks for a file's data
@@ -165,10 +178,31 @@ public sealed class SyncRoot : IDisposable
         var token = info.FileIdentityLength > 0 && info.FileIdentity != IntPtr.Zero
             ? Encoding.UTF8.GetString(CopyBytes(info.FileIdentity, (int)info.FileIdentityLength)) : "";
         var path = info.NormalizedPath != IntPtr.Zero ? Marshal.PtrToStringUni(info.NormalizedPath) ?? "" : "";
-        var cts = new CancellationTokenSource();
-        root._fetches[info.TransferKey] = cts;
         var (ck, tk, rk, size) = (info.ConnectionKey, info.TransferKey, info.RequestKey, info.FileSize);
-        Task.Run(() => root.Transfer(ck, tk, rk, token, path, offset, length, size, cts.Token));
+        lock (root._fetchLock)
+        {
+            if (!root._stopping)
+            {
+                var cts = new CancellationTokenSource();
+                root._fetches.Add(cts, (tk, rk));
+                _ = Task.Run(() =>
+                {
+                    try { root.Transfer(ck, tk, rk, token, path, offset, length, size, cts.Token); }
+                    finally
+                    {
+                        lock (root._fetchLock)
+                        {
+                            root._fetches.Remove(cts);
+                            cts.Dispose();
+                            Monitor.PulseAll(root._fetchLock);
+                        }
+                    }
+                });
+                return;
+            }
+        }
+        try { Execute(ck, tk, rk, IntPtr.Zero, offset, length, STATUS_CLOUD_FILE_UNSUCCESSFUL); }
+        catch { }
     }
 
     static void OnCancelFetch(IntPtr infoPtr, IntPtr paramsPtr)
@@ -176,8 +210,12 @@ public sealed class SyncRoot : IDisposable
         try
         {
             var info = Marshal.PtrToStructure<CF_CALLBACK_INFO>(infoPtr);
-            if (GCHandle.FromIntPtr(info.CallbackContext).Target is SyncRoot root && root._fetches.TryRemove(info.TransferKey, out var cts))
-                cts.Cancel();
+            if (info.StructSize < 152) info.RequestKey = 0;
+            if (GCHandle.FromIntPtr(info.CallbackContext).Target is SyncRoot root)
+                lock (root._fetchLock)
+                    foreach (var (cts, key) in root._fetches)
+                        if (key.Transfer == info.TransferKey && (info.RequestKey == 0 || key.Request == info.RequestKey))
+                            cts.Cancel();
         }
         catch { }
     }
@@ -248,7 +286,6 @@ public sealed class SyncRoot : IDisposable
             }
             catch { }
         }
-        finally { _fetches.TryRemove(tk, out _); }
     }
 
     static int _opInfoSize = Marshal.SizeOf<CF_OPERATION_INFO>();

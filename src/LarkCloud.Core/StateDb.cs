@@ -74,7 +74,7 @@ public sealed class StateDb : IDisposable
         {
             foreach (var p in _all.Keys.Where(p => p == from || p.StartsWith(from + "/", StringComparison.Ordinal)).ToList())
             {
-                var e = _all[p];
+                var e = _all[p].Clone();
                 Remove(p);
                 e.Path = to + p[from.Length..];
                 Put(e);
@@ -108,10 +108,17 @@ public sealed class StateDb : IDisposable
     /// <summary>Write all changes made since the last commit.</summary>
     public void Commit()
     {
-        List<KeyValuePair<string, BaseEntry?>> work;
-        lock (_lock) { work = _dirty.ToList(); _dirty.Clear(); }
-        if (work.Count == 0) return;
-        lock (_dbLock) WriteAll(work);
+        lock (_dbLock)
+        {
+            List<KeyValuePair<string, BaseEntry?>> work;
+            lock (_lock) work = _dirty.ToList();
+            if (work.Count == 0) return;
+            WriteAll(work);
+            lock (_lock)
+                foreach (var (path, entry) in work)
+                    if (_dirty.TryGetValue(path, out var current) && ReferenceEquals(current, entry))
+                        _dirty.Remove(path);
+        }
     }
 
     void WriteAll(List<KeyValuePair<string, BaseEntry?>> work)
@@ -145,7 +152,7 @@ public sealed class StateDb : IDisposable
 
     public void Dispose()
     {
-        try { Commit(); } catch { }
+        try { Commit(); } catch (Exception ex) { Log.Error($"Couldn't save sync history: {ex.Message}"); }
         lock (_dbLock) _db.Dispose();
         SqliteConnection.ClearAllPools();
     }

@@ -34,6 +34,7 @@ public sealed class PairRunner : IDisposable
     readonly Config _cfg;
     readonly LarkAuth _auth;
     readonly HttpClient _http;
+    readonly LarkRequestLimiter _requestLimiter;
     readonly object _lock = new();
     PairStatus _status = new();
     public event Action? Changed;
@@ -53,8 +54,10 @@ public sealed class PairRunner : IDisposable
 
     readonly Thread _thread, _maintThread;
     readonly AutoResetEvent _wake = new(false), _maintWake = new(false);
+    readonly CancellationTokenSource _shutdown = new();
     volatile bool _stop;
-    bool _fullRequested = true, _allowDeletes, _restore, _retryFailed, _freeAll;
+    bool _fullRequested = true, _restore, _retryFailed, _freeAll;
+    string? _approvedDeletes;
     readonly HashSet<string> _changed = new(StringComparer.OrdinalIgnoreCase);
     DateTime _lastChange = DateTime.MinValue, _nextFull = DateTime.MinValue, _recheckAt = DateTime.MaxValue;
     readonly ConcurrentQueue<string> _maintQueue = new();
@@ -65,12 +68,13 @@ public sealed class PairRunner : IDisposable
     bool _manual;                     // the next full pass was asked for by the person ("Sync now")
     volatile bool _showProgress;      // this pass shows "Checking Lark…" even after the first check
 
-    public PairRunner(Pair pair, Config cfg, LarkAuth auth, HttpClient http)
+    public PairRunner(Pair pair, Config cfg, LarkAuth auth, HttpClient http, LarkRequestLimiter requestLimiter)
     {
         Pair = pair;
         _cfg = cfg;
         _auth = auth;
         _http = http;
+        _requestLimiter = requestLimiter;
         _thread = new Thread(Loop) { IsBackground = true, Name = "sync " + pair.Id };
         _maintThread = new Thread(Maintenance) { IsBackground = true, Name = "files " + pair.Id };
     }
@@ -94,7 +98,7 @@ public sealed class PairRunner : IDisposable
     /// <summary>"Sync now" clicked: same full check, but its progress is shown instead of running quietly.</summary>
     public void SyncNowByUser() { lock (_lock) { _fullRequested = true; _manual = true; } _wake.Set(); }
     public void RetryFailed() { lock (_lock) { _retryFailed = true; _fullRequested = true; } _wake.Set(); }
-    public void AllowDeletes() { lock (_lock) { _allowDeletes = true; _fullRequested = true; } _wake.Set(); }
+    public void AllowDeletes(string approval) { lock (_lock) { _approvedDeletes = approval; _fullRequested = true; } _wake.Set(); }
     public void RestoreDeletes() { lock (_lock) { _restore = true; _fullRequested = true; } _wake.Set(); }
     public void FreeUpSpaceNow() { _freeAll = true; _maintWake.Set(); }
     public void SetPaused(bool paused) { Pair.Paused = paused; if (!paused) SyncNow(); else _wake.Set(); }
@@ -135,14 +139,20 @@ public sealed class PairRunner : IDisposable
         try
         {
             if (string.IsNullOrEmpty(Pair.LocalFolder)) throw new IOException("No folder on this PC was chosen.");
-            Directory.CreateDirectory(Pair.LocalFolder);
+            var dbPath = Path.Combine(AppPaths.PairDir(Pair.Id), "state.db");
+            if (!Directory.Exists(Pair.LocalFolder))
+            {
+                if (File.Exists(dbPath))
+                    throw new DirectoryNotFoundException($"The synced folder “{Pair.LocalFolder}” is missing. Move it back to resume syncing.");
+                Directory.CreateDirectory(Pair.LocalFolder);
+            }
             var drive = new DriveInfo(Path.GetPathRoot(Pair.LocalFolder)!);
             if (!string.Equals(drive.DriveFormat, "NTFS", StringComparison.OrdinalIgnoreCase))
                 throw new IOException($"“{Pair.LocalFolder}” is on a {drive.DriveFormat} drive. Files on demand only works on NTFS drives (like C:).");
-            _api = new LarkApi(_auth, _http, Pair.IsWiki ? "" : Pair.FolderToken);
+            _api = new LarkApi(_auth, _http, Pair.IsWiki ? "" : Pair.FolderToken, lifetime: _shutdown.Token, limiter: _requestLimiter);
             _local = new CfLocal(Pair.LocalFolder);
             LoadOpened();
-            _state = new StateDb(Path.Combine(AppPaths.PairDir(Pair.Id), "state.db"));
+            _state = new StateDb(dbPath);
             IRemoteDrive inner = Pair.IsWiki ? new WikiRemote(_api, Pair.WikiSpace!, Pair.WikiNode, Pair.TenantHost) : _api;
             var st = _state;
             _remote = new RemoteFeatures(inner, _api, st.GetMeta, st.SetMeta);
@@ -152,6 +162,7 @@ public sealed class PairRunner : IDisposable
                 MaxDeletes = _cfg.MaxDeletes, ConfirmMassDeletes = _cfg.ConfirmMassDeletes, DeleteWins = _cfg.DeleteWins, MaxTransfers = _cfg.MaxTransfers, TenantHost = Pair.TenantHost,
                 Ignore = _ignore = new IgnoreRules(_cfg.ExtraIgnore), Settle = TimeSpan.FromSeconds(_cfg.SettleSeconds),
                 ZipBlocked = _cfg.ZipBlockedFiles, DocCopies = Pair.DocCopies, DocCopyFormat = _cfg.DocCopyFormat, Label = Pair.Label,
+                Cancellation = _shutdown.Token,
             };
             _engine = new CloudEngine(_remote, _local, _state, idx, _opts);
             _engine.Progress = OnProgress;
@@ -168,6 +179,10 @@ public sealed class PairRunner : IDisposable
         {
             Log.Error($"{Pair.Label}: can't start: {ex}");
             SetStatus(SyncState.Error, ex.Message);
+            _watch?.Dispose();
+            _attrWatch?.Dispose();
+            _root?.Dispose();
+            _root = null;
             _engine = null;
             _state?.Dispose();
             _state = null;
@@ -238,7 +253,8 @@ public sealed class PairRunner : IDisposable
                 if (!Setup()) { _wake.WaitOne(TimeSpan.FromMinutes(1)); continue; }
                 ApplyPendingSettings();
                 var now = DateTime.UtcNow;
-                bool full, allow = false, restore = false, retry = false, manual = false;
+                bool full, restore = false, retry = false, manual = false;
+                string? approval = null;
                 List<string>? changed = null;
                 TimeSpan? wait = null;
                 lock (_lock)
@@ -247,7 +263,7 @@ public sealed class PairRunner : IDisposable
                     var settled = _changed.Count > 0 && now - _lastChange >= TimeSpan.FromSeconds(_cfg.SettleSeconds);
                     // A paused full check waits while the quick pass for the settled changes runs (unless someone asked
                     // for something that needs the full pass: deletions, restore, retry).
-                    var quickFirst = full && _fullPaused && settled && !_allowDeletes && !_restore && !_retryFailed && _engine!.Index.Complete;
+                    var quickFirst = full && _fullPaused && settled && _approvedDeletes == null && !_restore && !_retryFailed && _engine!.Index.Complete;
                     if (quickFirst) full = false;
                     if (!full && !settled && now < _recheckAt)
                     {
@@ -261,9 +277,13 @@ public sealed class PairRunner : IDisposable
                         if (!full) changed = _changed.ToList();
                         _changed.Clear();
                         _recheckAt = DateTime.MaxValue;
-                        (allow, restore, retry) = (_allowDeletes, _restore, _retryFailed);
+                        (approval, restore, retry) = (_approvedDeletes, _restore, _retryFailed);
                         manual = full && _manual;
-                        if (!quickFirst) _fullRequested = _allowDeletes = _restore = _retryFailed = _manual = false;
+                        if (!quickFirst)
+                        {
+                            _fullRequested = _restore = _retryFailed = _manual = false;
+                            _approvedDeletes = null;
+                        }
                         if (full) _fullPaused = false;
                     }
                 }
@@ -283,8 +303,8 @@ public sealed class PairRunner : IDisposable
                 if (manual) SetStatus(SyncState.Syncing, "Checking for changes…");
                 SyncResult res;
                 // A full check may pause when quick work is ready (never when it has to apply deletions / restore).
-                Func<bool>? yield = full && !allow && !restore ? QuickWorkReady : null;
-                try { res = _engine!.Run(allowDeletes: allow, changed: full ? null : changed, shouldYield: yield); }
+                Func<bool>? yield = full && approval == null && !restore ? QuickWorkReady : null;
+                try { res = _engine!.Run(approvedDeletes: approval, changed: full ? null : changed, shouldYield: yield); }
                 finally { _showProgress = false; }
                 var took = DateTime.UtcNow - t0;
                 failures = 0;
@@ -296,6 +316,7 @@ public sealed class PairRunner : IDisposable
                 }
                 AfterPass(res, took);
             }
+            catch (Exception) when (_stop) { break; }
             catch (NeedLoginException ex)
             {
                 Log.Warn($"{Pair.Label}: {ex.Message}");
@@ -303,7 +324,7 @@ public sealed class PairRunner : IDisposable
                 if (!_signInWarned) { _signInWarned = true; NeedSignIn?.Invoke(); }
                 _wake.WaitOne(TimeSpan.FromSeconds(30));
             }
-            catch (Exception ex) when (!_stop)
+            catch (Exception ex)
             {
                 failures++;
                 var wait = TimeSpan.FromSeconds(Math.Min(300, 15 * Math.Pow(2, Math.Min(failures, 5))));
@@ -374,7 +395,7 @@ public sealed class PairRunner : IDisposable
             if (_stop || _local == null || Pair.Paused) continue;
             try
             {
-                while (_hydrateQueue.TryDequeue(out var rel)) Hydrate(rel);
+                while (!_stop && _hydrateQueue.TryDequeue(out var rel)) Hydrate(rel);
                 var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 while (_maintQueue.TryDequeue(out var full)) paths.Add(full);
                 foreach (var full in paths) CheckPin(full);
@@ -418,12 +439,14 @@ public sealed class PairRunner : IDisposable
 
     void Hydrate(string rel)
     {
-        try { _local!.Hydrate(rel, CancellationToken.None); Log.Info($"Kept on this device: {rel}"); }
+        if (_stop) return;
+        try { _local!.Hydrate(rel, _shutdown.Token); Log.Info($"Kept on this device: {rel}"); }
         catch (Exception ex) { Log.Warn($"Couldn't download {rel}: {ex.Message}"); }
     }
 
     void Dehydrate(string rel)
     {
+        if (_stop) return;
         try { _local!.Dehydrate(rel); Log.Info($"Freed up space: {rel}"); }
         catch (IOException) { /* open in an app right now: next time */ }
         catch (Exception ex) { Log.Warn($"Couldn't free up space for {rel}: {ex.Message}"); }
@@ -505,13 +528,17 @@ public sealed class PairRunner : IDisposable
     {
         if (_stop) return;
         _stop = true;
+        _shutdown.Cancel();
         _wake.Set();
         _maintWake.Set();
+        if (_thread.IsAlive) _thread.Join();
+        _root?.StopFetches();
+        if (_maintThread.IsAlive) _maintThread.Join();
         _watch?.Dispose();
         _attrWatch?.Dispose();
-        if (_thread.IsAlive) _thread.Join(TimeSpan.FromSeconds(10));
-        SaveOpened();
         _root?.Dispose();
+        SaveOpened();
         _state?.Dispose();
+        _shutdown.Dispose();
     }
 }

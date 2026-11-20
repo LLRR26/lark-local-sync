@@ -5,6 +5,62 @@ namespace LarkCloud.Tests;
 
 public class EngineTests
 {
+    [Fact]
+    public void An_edit_during_upload_is_sent_in_the_next_pass()
+    {
+        using var e = new Env();
+        e.Local.UserWrite("file.txt", B("first"));
+        e.Remote.UploadFilter = (_, _) =>
+        {
+            e.Local.UserWrite("file.txt", B("later"));
+            return null;
+        };
+        Assert.Equal(1, e.Sync().Uploaded);
+        Assert.Equal(B("first"), e.Remote.Find("file.txt")!.Content);
+        Assert.Equal(BaseEntry.LocalUploadPending, e.State.Get("file.txt")!.LMTime);
+
+        e.Remote.UploadFilter = null;
+        Assert.Equal(1, e.Sync().Uploaded);
+        Assert.Equal(B("later"), e.Remote.Find("file.txt")!.Content);
+        e.AssertSettled();
+    }
+
+    [Fact]
+    public void A_remote_rename_with_a_same_size_edit_refreshes_the_downloaded_copy()
+    {
+        using var e = new Env();
+        e.Remote.AddFile("old.txt", B("first"));
+        e.Sync();
+        e.Local.UserOpen("old.txt");
+
+        e.Remote.RenamePath("old.txt", "new.txt");
+        e.Remote.Edit("new.txt", B("later"));
+        e.Sync();
+
+        Assert.Null(e.Local.Stat("old.txt"));
+        e.Local.UserOpen("new.txt");
+        Assert.Equal(B("later"), e.Local.Data("new.txt"));
+    }
+
+    [Fact]
+    public void Approved_folder_deletion_waits_for_review_when_its_contents_change()
+    {
+        using var e = new Env();
+        e.Options.ConfirmMassDeletes = true;
+        e.Options.MaxDeletes = 1;
+        e.Remote.AddFile("folder/a.txt", B("a"));
+        e.Remote.AddFile("folder/b.txt", B("b"));
+        e.Sync();
+        e.Local.UserDelete("folder");
+        var original = Assert.Single(e.Sync().PendingDeletes);
+
+        e.Remote.AddFile("folder/c.txt", B("c"));
+        var revised = Assert.Single(e.Sync(approvedDeletes: original.Approval).PendingDeletes);
+        Assert.NotEqual(original.Approval, revised.Approval);
+        Assert.NotNull(e.Remote.Find("folder/c.txt"));
+        Assert.Equal(0, e.Count("delete"));
+        Assert.Equal(1, e.Sync(approvedDeletes: revised.Approval).DeletedRemote);
+    }
     static byte[] B(string s) => Encoding.UTF8.GetBytes(s);
 
     [Fact]
@@ -456,7 +512,7 @@ public class EngineTests
         var res = e.Sync();
         Assert.Equal(30, res.PendingDeletes.Count);
         Assert.Equal(30, e.Local.Paths().Count);
-        res = e.Sync(allowDeletes: true);
+        res = e.Sync(approvedDeletes: res.PendingDeletes[0].Approval);
         Assert.Equal(30, res.DeletedLocal);
         Assert.Empty(e.Local.Paths());
     }

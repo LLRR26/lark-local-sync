@@ -171,12 +171,13 @@ public sealed class LarkAuth
 
     /// <summary>A valid access token, refreshed when it's about to expire.</summary>
     double _nextRefreshTry;                    // after a failed renewal, wait before asking Lark again
-    public Action<TimeSpan> Sleep = t => Thread.Sleep(t);
+    public Action<TimeSpan>? Sleep;
 
-    public string AccessToken(bool forceRefresh = false)
+    public string AccessToken(bool forceRefresh = false, CancellationToken ct = default)
     {
         lock (_lock)
         {
+            ct.ThrowIfCancellationRequested();
             var t = _tok ?? throw new NeedLoginException("Not signed in");
             var expires = (double?)t["expires_at"] ?? 0;
             if (!forceRefresh && expires - 300 > NowS) return (string)t["access_token"]!;
@@ -185,18 +186,33 @@ public sealed class LarkAuth
             // The current token is renewed 5 minutes early. If a renewal just failed (network blip, Lark busy),
             // keep using the current token while it's still valid instead of asking again for every request.
             if (!forceRefresh && NowS < _nextRefreshTry && expires - 15 > NowS) return (string)t["access_token"]!;
-            try { return Refresh(t); }
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromSeconds(30));
+            try { return Refresh(t, timeout.Token); }
             catch (LarkUnreachableException)
             {
                 _nextRefreshTry = NowS + 30;
                 if (!forceRefresh && expires - 15 > NowS) return (string)t["access_token"]!;
                 throw;
             }
+            catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+            {
+                _nextRefreshTry = NowS + 30;
+                if (!forceRefresh && expires - 15 > NowS) return (string)t["access_token"]!;
+                throw new LarkUnreachableException("Timed out while renewing the Lark sign-in.", ex);
+            }
         }
     }
 
     /// <summary>Renew the sign-in, trying a few times on network errors / "too many requests" / server errors.</summary>
-    string Refresh(JsonObject t)
+    void Delay(TimeSpan delay, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (Sleep != null) Sleep(delay);
+        else Task.Delay(delay, ct).GetAwaiter().GetResult();
+    }
+
+    string Refresh(JsonObject t, CancellationToken ct)
     {
         for (var attempt = 0; ; attempt++)
         {
@@ -209,32 +225,33 @@ public sealed class LarkAuth
             try
             {
                 r = _http.PostAsync(AccountsBase + "/oauth/v3/token",
-                    new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json")).GetAwaiter().GetResult();
+                    new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json"), ct).GetAwaiter().GetResult();
             }
-            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+            catch (Exception ex) when (ex is HttpRequestException || (ex is TaskCanceledException && !ct.IsCancellationRequested))
             {
                 if (attempt >= 2) throw new LarkUnreachableException($"Can't reach Lark to renew the sign-in ({ex.Message})", ex);
-                Sleep(TimeSpan.FromSeconds(2 << attempt));
+                Delay(TimeSpan.FromSeconds(2 << attempt), ct);
                 continue;
             }
+            using var response = r;
             var code = (int)r.StatusCode;
             if (code == 429 || code >= 500)
             {
                 if (attempt >= 2) throw new LarkUnreachableException($"Lark is busy and couldn't renew the sign-in (HTTP {code})");
-                Sleep(TimeSpan.FromSeconds(3 << attempt));
+                Delay(TimeSpan.FromSeconds(3 << attempt), ct);
                 continue;
             }
-            return RefreshAnswer(r);
+            return RefreshAnswer(r, ct);
         }
     }
 
-    string RefreshAnswer(HttpResponseMessage r)
+    string RefreshAnswer(HttpResponseMessage r, CancellationToken ct)
     {
         {
             var data = ReadJson(r).GetAwaiter().GetResult();
             if ((string?)data["access_token"] != null)
             {
-                AcceptAsync(data, true).GetAwaiter().GetResult();
+                AcceptAsync(data, true, ct).GetAwaiter().GetResult();
                 return (string)_tok!["access_token"]!;
             }
             var err = (string?)data["error"] ?? (string?)data["msg"] ?? $"HTTP {(int)r.StatusCode}";
@@ -248,7 +265,7 @@ public sealed class LarkAuth
         }
     }
 
-    async Task AcceptAsync(JsonObject data, bool keepUser)
+    async Task AcceptAsync(JsonObject data, bool keepUser, CancellationToken ct = default)
     {
         var now = NowS;
         var old = _tok ?? new JsonObject();
@@ -273,7 +290,8 @@ public sealed class LarkAuth
             {
                 var req = new HttpRequestMessage(HttpMethod.Get, OpenBase + "/open-apis/authen/v1/user_info");
                 req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", (string)tok["access_token"]!);
-                var info = (await ReadJson(await _http.SendAsync(req).ConfigureAwait(false)))["data"];
+                using var response = await _http.SendAsync(req, ct).ConfigureAwait(false);
+                var info = (await ReadJson(response).ConfigureAwait(false))["data"];
                 tok["user_name"] = (string?)info?["name"] ?? (string?)info?["en_name"] ?? "";
             }
             catch (Exception) { }

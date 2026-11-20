@@ -20,6 +20,14 @@ public interface ICloudLocal
     void UpdateFilePlaceholder(string rel, string token, long size, DateTime mtimeUtc);
     /// <summary>After uploading a file or creating a folder in Lark: link it to `token` and mark it in sync.</summary>
     LocalItem MarkSynced(string rel, string token);
+    LocalItem? MarkUploaded(string rel, string token, string snapshot)
+    {
+        using var copy = File.OpenRead(snapshot);
+        using var current = OpenForUpload(rel);
+        return System.Security.Cryptography.SHA256.HashData(copy).AsSpan()
+            .SequenceEqual(System.Security.Cryptography.SHA256.HashData(current))
+            ? MarkSynced(rel, token) : null;
+    }
     void Move(string from, string to);
     /// <summary>Delete; `recycle` sends it to the Recycle Bin.</summary>
     void Delete(string rel, bool recycle);

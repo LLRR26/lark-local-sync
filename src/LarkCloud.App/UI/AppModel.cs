@@ -27,7 +27,7 @@ internal interface IAppModel
     IFolderSource OpenFolderSource();          // Lark browsing for the add-folder dialog
     void AddPair(Pair p);
     void RetryFailed(string? pairId);          // "Try again now": one folder, or all
-    void AllowDeletes(string pairId);          // review deletions: go ahead
+    void AllowDeletes(string pairId, string approval);
     void RestoreDeletes(string pairId);        // review deletions: put the items back
     void ShowProblems(string? pairId);         // the Files that can't sync page (one folder, or all)
     void ShowDeletions(string pairId);
