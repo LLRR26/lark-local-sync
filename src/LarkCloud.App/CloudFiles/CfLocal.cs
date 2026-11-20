@@ -61,6 +61,24 @@ public sealed class CfLocal : ICloudLocal
         return outList;
     }
 
+    public LocalPresence CheckPresence(string rel)
+    {
+        try
+        {
+            File.GetAttributes(FullPath(rel));
+            return LocalPresence.Present;
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            // A disconnected drive or a moved sync root also makes its children appear missing.
+            return Directory.Exists(Root) ? LocalPresence.Missing : LocalPresence.Unreadable;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return LocalPresence.Unreadable;
+        }
+    }
+
     public LocalItem? Stat(string rel)
     {
         var full = FullPath(rel);

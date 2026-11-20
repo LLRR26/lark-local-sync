@@ -63,6 +63,56 @@ public class EngineTests
     }
     static byte[] B(string s) => Encoding.UTF8.GetBytes(s);
 
+    [Theory]
+    [InlineData(LocalPresence.Unreadable)]
+    [InlineData(LocalPresence.Present)]
+    public void Cloud_delete_waits_until_the_final_local_check_confirms_absence(LocalPresence presence)
+    {
+        using var e = new Env();
+        e.Remote.AddFile("a.txt", B("data"));
+        e.Sync();
+        e.Local.UserDelete("a.txt");
+        e.Local.PresenceOverride = _ => presence;
+        Assert.Equal(0, e.Sync().DeletedRemote);
+        Assert.Equal(0, e.Count("delete"));
+        Assert.NotNull(e.State.Get("a.txt"));
+        e.Local.PresenceOverride = null;
+        Assert.Equal(1, e.Sync().DeletedRemote);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Approved_large_folder_is_emptied_and_new_arrivals_require_fresh_review(bool addDuringDelete)
+    {
+        using var e = new Env();
+        e.Options.ConfirmMassDeletes = true;
+        e.Options.MaxDeletes = 1;
+        e.Remote.MaxFolderDelete = 0; // only empty folders can be trashed
+        var first = e.Remote.AddFile("folder/sub/a.txt", B("a"));
+        e.Remote.AddFile("folder/sub/b.txt", B("b"));
+        e.Sync();
+        e.Local.UserDelete("folder");
+        var review = Assert.Single(e.Sync().PendingDeletes);
+        e.Remote.DeleteFault = token =>
+        {
+            if (addDuringDelete && token == first) e.Remote.AddFile("folder/sub/new.txt", B("new"));
+            return null;
+        };
+        var result = e.Sync(approvedDeletes: review.Approval);
+        if (addDuringDelete)
+        {
+            Assert.Equal(0, result.DeletedRemote);
+            Assert.True(e.Engine.ConfirmDeletesSoon);
+            Assert.NotNull(e.Remote.Find("folder/sub/new.txt"));
+            var revised = Assert.Single(e.Sync(approvedDeletes: review.Approval).PendingDeletes);
+            Assert.NotEqual(review.Approval, revised.Approval);
+            result = e.Sync(approvedDeletes: revised.Approval);
+        }
+        Assert.Equal(1, result.DeletedRemote);
+        Assert.Empty(e.Remote.Paths());
+    }
+
     [Fact]
     public void Lark_files_show_up_without_being_downloaded()
     {

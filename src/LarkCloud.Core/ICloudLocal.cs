@@ -2,6 +2,8 @@ using System.Text.RegularExpressions;
 
 namespace LarkCloud.Core;
 
+public enum LocalPresence { Unreadable, Present, Missing }
+
 /// <summary>The PC side: a folder whose files are Windows cloud placeholders. The Windows app implements
 /// it with the Cloud Files API; the tests use an in-memory fake. Paths are relative, "/"-separated.</summary>
 public interface ICloudLocal
@@ -10,6 +12,7 @@ public interface ICloudLocal
     string FullPath(string rel);
     List<LocalItem> Scan();
     LocalItem? Stat(string rel);
+    LocalPresence CheckPresence(string rel);
 
     /// <summary>Folder that mirrors a Lark folder (in sync).</summary>
     void CreateFolderPlaceholder(string rel, string token);

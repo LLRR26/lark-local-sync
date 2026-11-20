@@ -715,6 +715,7 @@ public sealed class CloudEngine
         if (nLark > 200 && nLark > files / 2) big = (big ?? "") + "lark:" + Fingerprint(deleteInLark.Select(b => b.Path));
         var review = _reviewRequired || approvedDeletes != null
             || (_opt.ConfirmMassDeletes && (nHere > _opt.MaxDeletes || nLark > _opt.MaxDeletes));
+        Dictionary<string, RemoteEntry>? reviewedEntries = null;
         if (review)
         {
             var affectedFolders = deleteInLark.Where(b => b.Kind == Kinds.Folder)
@@ -740,7 +741,7 @@ public sealed class CloudEngine
             }).Concat(deleteInLark.Select(b =>
                 System.Text.Json.JsonSerializer.Serialize(new { Side = "Lark", b.Path, b.Token, Version = _r.GetValueOrDefault(b.Path)?.MTime })))
               .Concat(affectedRemote.Values.Where(Affected).Select(e =>
-                System.Text.Json.JsonSerializer.Serialize(new { Side = "Contents", e.Path, e.Token, e.MTime, e.ParentToken })));
+                System.Text.Json.JsonSerializer.Serialize(new { Side = "Contents", e.Path, e.Type, e.Token, e.MTime, e.ParentToken })));
             var signature = Fingerprint(detail, preserveCase: true);
             if (rows.Count > 0 && (!_res.Full || approvedDeletes != signature))
             {
@@ -751,7 +752,11 @@ public sealed class CloudEngine
                 deleteInLark.Clear();
                 if (!_res.Full) ConfirmDeletesSoon = true;
             }
-            else if (_res.Full) _reviewRequired = rows.Count > 0;
+            else if (_res.Full)
+            {
+                _reviewRequired = rows.Count > 0;
+                if (rows.Count > 0) reviewedEntries = affectedRemote.Values.Where(Affected).ToDictionary(e => e.Token);
+            }
         }
         else if (big != null && big != _bigDeleteSeen)
         {
@@ -780,7 +785,7 @@ public sealed class CloudEngine
         foreach (var (r, l) in conflicts) Conflict(r, l, uploads);
         RunUploads(uploads);
         DeleteHere(deleteHere);
-        DeleteInLark(deleteInLark, reviewed: approvedDeletes != null && _res.PendingDeletes.Count == 0);
+        DeleteInLark(deleteInLark, reviewedEntries);
     }
 
     /// <summary>A folder deleted on the PC is deleted in Lark only if nothing inside it changed in Lark since.</summary>
@@ -1351,7 +1356,7 @@ public sealed class CloudEngine
         }
     }
 
-    void DeleteInLark(List<BaseEntry> items, bool reviewed)
+    void DeleteInLark(List<BaseEntry> items, Dictionary<string, RemoteEntry>? reviewedEntries)
     {
         // Only the topmost items are deleted (a folder takes everything inside it along), several at a time.
         var folders = items.Where(b => b.Kind == Kinds.Folder).Select(b => b.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -1364,28 +1369,34 @@ public sealed class CloudEngine
         var top = new List<BaseEntry>();
         foreach (var b in items)
         {
-            if (InsideDeletedFolder(b.Path)) _state.Remove(b.Path);
-            else top.Add(b);
+            if (!InsideDeletedFolder(b.Path)) top.Add(b);
         }
         if (top.Count == 0) return;
         var done = 0;
         Parallel.ForEach(top, new ParallelOptions { MaxDegreeOfParallelism = Math.Clamp(_opt.MaxTransfers, 1, 8) }, b =>
         {
-            DeleteOneInLark(b, reviewed);
+            DeleteOneInLark(b, reviewedEntries);
             var n = Interlocked.Increment(ref done);
             if (top.Count > 10 && n % 10 == 0) Progress($"Deleting in Lark: {n:N0} of {top.Count:N0}…");
         });
     }
 
-    void DeleteOneInLark(BaseEntry b, bool reviewed)
+    void DeleteOneInLark(BaseEntry b, Dictionary<string, RemoteEntry>? reviewedEntries)
     {
         {
             try
             {
                 _opt.Cancellation.ThrowIfCancellationRequested();
-                if (_local.Stat(b.Path) != null) { BusyFilesWaiting = true; return; }
-                // A recursive fallback would enumerate a new set of children after the review.
-                if (b.Kind == Kinds.Folder && !reviewed) DeleteFolderInLark(b.Token!, b.Path);
+                if (_local.CheckPresence(b.Path) != LocalPresence.Missing) { BusyFilesWaiting = true; return; }
+                if (b.Kind == Kinds.Folder && reviewedEntries != null)
+                {
+                    if (!DeleteReviewedFolder(reviewedEntries[b.Token!], reviewedEntries, b.Path))
+                    {
+                        ConfirmDeletesSoon = true;
+                        return;
+                    }
+                }
+                else if (b.Kind == Kinds.Folder) DeleteFolderInLark(b.Token!, b.Path);
                 else _remote.Delete(b.Token!, b.RType ?? "file");
                 _index.Remove(b.Token!);
                 _state.RemoveTree(b.Path);
@@ -1403,6 +1414,42 @@ public sealed class CloudEngine
             }
             catch (Exception ex) { Fail(b.Path, ex, "delete this item in Lark"); }
         }
+    }
+
+    // Work from the approved snapshot. A direct delete of a populated folder would also
+    // trash children added after review. Only send a folder delete after an empty listing.
+    bool DeleteReviewedFolder(RemoteEntry folder, Dictionary<string, RemoteEntry> reviewed, string localRoot)
+    {
+        var children = _remote.ListFolder(folder.Token);
+        foreach (var child in children)
+        {
+            if (!reviewed.TryGetValue(child.Token, out var expected) || expected.ParentToken != folder.Token
+                || expected.Type != child.Type || expected.MTime != child.MTime
+                || expected.Path != PathUtil.Join(folder.Path, child.Path))
+                return false;
+        }
+        foreach (var child in children)
+        {
+            _opt.Cancellation.ThrowIfCancellationRequested();
+            if (_local.CheckPresence(localRoot) != LocalPresence.Missing) return false;
+            try
+            {
+                if (child.IsFolder)
+                {
+                    if (!DeleteReviewedFolder(reviewed[child.Token], reviewed, localRoot)) return false;
+                }
+                else _remote.Delete(child.Token, child.Type);
+            }
+            catch (LarkApiException ex) when (ex.IsGone) { }
+            catch (LarkApiException ex) when (ex.IsPermission)
+            {
+                throw new IOException($"Couldn't remove reviewed item {reviewed[child.Token].Path}: {ex.Message}", ex);
+            }
+        }
+        if (children.Count > 0 && _remote.ListFolder(folder.Token).Count > 0) return false;
+        if (_local.CheckPresence(localRoot) != LocalPresence.Missing) return false;
+        _remote.Delete(folder.Token, Kinds.Folder);
+        return true;
     }
 
     /// <summary>Delete a Lark folder. Lark refuses very big folders in one request (server error 500), so then

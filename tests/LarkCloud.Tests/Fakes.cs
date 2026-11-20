@@ -273,6 +273,10 @@ public sealed class FakeLocal : ICloudLocal
     // ---------------------------------------------------------------- ICloudLocal
     public List<LocalItem> Scan() { lock (_lock) return Items.Keys.Select(k => Stat(k)!).ToList(); }
 
+    public Func<string, LocalPresence>? PresenceOverride;
+    public LocalPresence CheckPresence(string rel) =>
+        PresenceOverride?.Invoke(rel) ?? (Stat(rel) == null ? LocalPresence.Missing : LocalPresence.Present);
+
     public LocalItem? Stat(string rel)
     {
         lock (_lock)
