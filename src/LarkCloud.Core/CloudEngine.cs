@@ -1040,7 +1040,12 @@ public sealed class CloudEngine
 
     string CreateRemoteFolder(string rel, string parentToken)
     {
-        var tok = _remote.CreateFolder(parentToken, PathUtil.Name(rel));
+        // Lark may already have it (another PC made it since this PC last looked): use that one rather than
+        // making a second folder of the same name, which would show up as "Name (2)" everywhere.
+        var name = PathUtil.Name(rel);
+        var tok = _remote.ListFolder(parentToken)
+                      .FirstOrDefault(e => e.IsFolder && e.Name == name && !_remoteTokens.Contains(e.Token))?.Token
+                  ?? _remote.CreateFolder(parentToken, name);
         _newFolders[rel] = tok;
         _dirtyRemote.Add(parentToken);
         _index.Put(new RemoteEntry { Path = rel, Token = tok, Type = Kinds.Folder }, parentToken);

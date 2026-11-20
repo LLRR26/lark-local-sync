@@ -1248,4 +1248,20 @@ public class EngineTests
         Assert.Null(e.Remote.Find("D"));
         Assert.Equal(uploads, e.Count("upload"));
     }
+
+    [Fact]
+    public void A_new_PC_folder_reuses_a_same_name_folder_Lark_already_has()
+    {
+        using var e = new Env();
+        e.Remote.AddFolder("Email");
+        e.Sync();
+
+        // Another PC made "Email/Incoming" in Lark; this PC hasn't looked inside "Email" since.
+        e.Remote.AddFolder("Email/Incoming");
+        e.Local.UserWrite("Email/Incoming/a.txt", B("a"));
+        e.Sync(changed: new[] { "unrelated.txt" });
+
+        Assert.Single(e.Remote.Nodes.Values, n => n.Name == "Incoming");
+        Assert.Equal(B("a"), e.Remote.Content("Email/Incoming/a.txt"));
+    }
 }
