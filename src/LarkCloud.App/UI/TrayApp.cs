@@ -24,13 +24,14 @@ internal sealed class TrayApp : IAppModel, IDisposable
     int _shownSize;
     readonly DispatcherTimer _spin = new() { Interval = TimeSpan.FromMilliseconds(110) };   // runs only while syncing, and only with animation effects on
     int _frame;
+    readonly Updater _updater = new();
 
     const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
 
     public TrayApp(SyncService svc)
     {
         _svc = svc;
-        _menu = new TrayMenu(MenuStatus, () => _svc.Config.GetPairs(), ShowFolders, _svc.SyncAllNow, TogglePauseAll, Quit);
+        _menu = new TrayMenu(MenuStatus, () => _svc.Config.GetPairs(), ShowFolders, _svc.SyncAllNow, TogglePauseAll, Quit, () => _updater.Installed, RestartToUpdate);
         _icon = new NotifyIcon { Icon = TrayIcons.State(SyncState.Starting, TrayIcons.TraySize), Text = AppPaths.AppTitle, Visible = true };
         _icon.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) OnLeftClick(); };
         _icon.MouseUp += (_, e) => { if (e.Button == MouseButtons.Right) _menu.ShowAtCursor(); };
@@ -46,6 +47,9 @@ internal sealed class TrayApp : IAppModel, IDisposable
         Motion.Changed += RefreshIcon;                 // Windows animation effects switched on or off
 
         if (!StartsWithWindows && !File.Exists(Path.Combine(AppPaths.DataDir, "startup-asked"))) { StartsWithWindows = true; File.WriteAllText(Path.Combine(AppPaths.DataDir, "startup-asked"), "1"); }
+
+        _updater.Ready += v => Ui_(() => Balloon($"Update {v} installed. Restart Lark Cloud Drive to use it.", ToolTipIcon.Info));
+        _updater.Start();
 
         Ui_(FirstRun);
     }
@@ -226,6 +230,21 @@ internal sealed class TrayApp : IAppModel, IDisposable
         if (!ConfirmDialog.Ask(_main, "Quit Lark Cloud Drive?",
                 "While it's closed, files that are only in Lark can't be opened and changes aren't synced." +
                 (downloading > 0 ? $"\n\n{downloading} file(s) are being opened right now." : ""), "Quit")) return;
+        Shutdown();
+    }
+
+    void RestartToUpdate()
+    {
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Environment.ProcessPath!, "--after-update") { UseShellExecute = false });
+        }
+        catch (Exception e) { Log.Error($"Restart after update failed: {e.Message}"); return; }
+        Shutdown();
+    }
+
+    void Shutdown()
+    {
         _tick.Stop();
         _spin.Stop();
         _icon.Visible = false;
@@ -236,6 +255,7 @@ internal sealed class TrayApp : IAppModel, IDisposable
 
     public void Dispose()
     {
+        _updater.Dispose();
         _tick.Stop();
         _spin.Stop();
         Motion.Changed -= RefreshIcon;

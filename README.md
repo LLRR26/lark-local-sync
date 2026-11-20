@@ -90,6 +90,17 @@ Everything else works like Lark Drive Sync:
    Otherwise fill in `dist\LarkCloud\config.json` yourself.
 3. The Lark developer app is the same one Lark Drive Sync uses: same scopes, nothing new to enable.
 
+## Releasing an update
+
+The app checks the public GitHub repo `LLRR26/lark-local-sync` for a newer release.
+
+1. Bump `<Version>` in `src\LarkCloud.App\LarkCloud.App.csproj` (the only place the version lives).
+2. Run `scripts\build.bat`.
+3. GitHub -> Releases -> new release, tag `vX.Y.Z` (same number as `<Version>`), upload **only** `dist\LarkCloud\LarkCloud.exe` (never `config.json`), publish. Don't mark it draft or pre-release.
+
+PCs pick it up within about 6 hours or at the next start, swap the file in the background and then show "Restart to update" in the tray menu.
+The exe must live in a folder the user can write to (not Program Files). PCs running a build without the updater need one manual replacement of `LarkCloud.exe`.
+
 ## Try it
 
 1. Run `dist\LarkCloud\LarkCloud.exe`. Sign in (same as Lark Drive Sync: approve the code in the browser).

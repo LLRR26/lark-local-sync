@@ -14,13 +14,14 @@ internal sealed class TrayMenu
 {
     readonly Func<(string Text, string Glyph)> _status;
     readonly Func<IReadOnlyList<Pair>> _pairs;
-    readonly Action _open, _syncNow, _togglePause, _quit;
+    readonly Action _open, _syncNow, _togglePause, _quit, _restart;
+    readonly Func<string?> _updated;
     Window? _anchor;                 // tiny invisible window at the cursor: gives the popup a foreground owner to lose focus from
     ContextMenu? _menu;
 
-    public TrayMenu(Func<(string Text, string Glyph)> status, Func<IReadOnlyList<Pair>> pairs, Action open, Action syncNow, Action togglePause, Action quit)
+    public TrayMenu(Func<(string Text, string Glyph)> status, Func<IReadOnlyList<Pair>> pairs, Action open, Action syncNow, Action togglePause, Action quit, Func<string?> updated, Action restart)
     {
-        _status = status; _pairs = pairs; _open = open; _syncNow = syncNow; _togglePause = togglePause; _quit = quit;
+        _status = status; _pairs = pairs; _open = open; _syncNow = syncNow; _togglePause = togglePause; _quit = quit; _updated = updated; _restart = restart;
     }
 
     [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
@@ -124,6 +125,7 @@ internal sealed class TrayMenu
         var allPaused = pairs.Count > 0 && pairs.All(p => p.Paused);
         m.Items.Add(allPaused ? Item("Resume syncing", "", _togglePause) : Item("Pause syncing", "", _togglePause));
         m.Items.Add(new Separator());
+        if (_updated() != null) m.Items.Add(Item("Restart to update", "", _restart));
         m.Items.Add(Item("Quit", "", _quit));
         return m;
     }

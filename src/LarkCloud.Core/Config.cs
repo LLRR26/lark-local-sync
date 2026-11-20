@@ -13,7 +13,10 @@ public static class AppPaths
 {
     public const string AppName = "LarkCloud";
     public const string AppTitle = "Lark Cloud Drive";
-    public const string Version = "0.1.0";
+    /// <summary>From the entry assembly (the csproj's &lt;Version&gt;), without any "+commit" suffix.</summary>
+    public static readonly string Version =
+        (System.Reflection.Assembly.GetEntryAssembly()?.GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+            .OfType<System.Reflection.AssemblyInformationalVersionAttribute>().FirstOrDefault()?.InformationalVersion ?? "0.0.0").Split('+')[0];
 
     public static string? Override;   // tests
 

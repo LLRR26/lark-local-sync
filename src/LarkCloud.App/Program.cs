@@ -23,6 +23,7 @@ internal static class Program
 #endif
         using var single = new Mutex(true, @"Local\LarkCloudDrive", out var first);
         using var show = new EventWaitHandle(false, EventResetMode.AutoReset, @"Local\LarkCloudDrive.Show");
+        if (!first && args.Contains("--after-update")) first = TakeOver(single);   // the old copy is still shutting down
         if (!first)
         {
             show.Set();                          // already running: ask it to show its window
@@ -58,5 +59,12 @@ internal static class Program
         listener.Start();
         app.Run();
         Log.Info("Stopped");
+    }
+
+    /// <summary>After an update restart, wait up to ~30 s for the previous instance to release the single-instance mutex.</summary>
+    static bool TakeOver(Mutex m)
+    {
+        try { return m.WaitOne(TimeSpan.FromSeconds(30)); }
+        catch (AbandonedMutexException) { return true; }   // previous owner exited without releasing: it is ours now
     }
 }
