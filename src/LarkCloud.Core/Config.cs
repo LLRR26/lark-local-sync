@@ -40,6 +40,9 @@ public sealed class Pair
     public bool Paused { get; set; }
     public bool DocCopies { get; set; }               // show read-only offline copies of Lark docs
     public bool FromIt { get; set; }                  // set by IT; can't be removed by the person
+    // Subfolders (relative, forward slashes) checked against Lark every ~30 s.
+    // ponytail: paths, not Lark tokens, so a rename drops the choice. Upgrade to tokens if that bites.
+    public List<string> CheckOften { get; set; } = new();
 
     public static string NewId() => "c" + Guid.NewGuid().ToString("N")[..8];
     public string FolderToken => IsWiki ? $"wiki:{WikiSpace}/{WikiNode}" : Config.TokenFromLink(FolderUrl);
@@ -75,6 +78,7 @@ public sealed class Pair
     {
         ["id"] = Id, ["folder_url"] = FolderUrl, ["folder_name"] = FolderName,
         ["local_folder"] = LocalFolder, ["paused"] = Paused, ["doc_copies"] = DocCopies,
+        ["check_often"] = new JsonArray(CheckOften.Select(x => (JsonNode)JsonValue.Create(x)!).ToArray()),
     };
 
     public static Pair FromJson(JsonNode n, bool fromIt = false) => new()
@@ -85,6 +89,7 @@ public sealed class Pair
         LocalFolder = Config.Expand((string?)n["local_folder"] ?? ""),
         Paused = (bool?)n["paused"] ?? false,
         DocCopies = (bool?)n["doc_copies"] ?? false,
+        CheckOften = n["check_often"] is JsonArray co ? co.Select(x => (string?)x).Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x!).ToList() : new(),
         FromIt = fromIt,
     };
 }
@@ -260,7 +265,7 @@ public sealed class Config
                 _defaultsApplied.Add(d.Id);
                 changed = true;
                 if (_pairs.Any(p => p.FolderToken == d.FolderToken) || LocalOverlap(d.LocalFolder) != null) continue;
-                _pairs.Add(new Pair { Id = d.Id, FolderUrl = d.FolderUrl, FolderName = d.FolderName, LocalFolder = d.LocalFolder });
+                _pairs.Add(new Pair { Id = d.Id, FolderUrl = d.FolderUrl, FolderName = d.FolderName, LocalFolder = d.LocalFolder, CheckOften = d.CheckOften.ToList() });
             }
             if (changed) Save();
         }
@@ -280,6 +285,17 @@ public sealed class Config
         lock (_lock)
         {
             foreach (var p in GetPairs().Where(p => p.Id == id)) p.Paused = paused;
+            Save();
+        }
+    }
+
+    /// <summary>Replace the folders checked often. The pair object is shared with its runner, which reads it before each pass.</summary>
+    public void SetCheckOften(string id, IEnumerable<string> folders)
+    {
+        lock (_lock)
+        {
+            var list = folders.ToList();
+            foreach (var p in GetPairs().Where(p => p.Id == id)) p.CheckOften = list;
             Save();
         }
     }

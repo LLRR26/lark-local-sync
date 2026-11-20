@@ -187,6 +187,7 @@ internal sealed partial class FoldersPage : UserControl, IPage
             : Item("Pause this folder", "\uE769", () => { _m.SetPaused(p.Id, true); Refresh(); }));
         menu.Items.Add(Item("Free up space…", "\uE753", () => FreeUp(r)));
         menu.Items.Add(Item("Offline doc copies", "\uE8A5", () => ToggleCopies(r), check: true, isOn: p.DocCopies));
+        menu.Items.Add(Item("Check often\u2026", "\uE72C", () => new CheckOftenDialog(_m.Settings, p) { Owner = Owner }.ShowDialog()));
         if (st.Items.Count > 0 || st.Info.Count > 0 || st.PendingDeletes.Count > 0) menu.Items.Add(new Separator());
         if (st.Items.Count > 0 || st.Info.Count > 0) menu.Items.Add(Item("Files that can't sync", "\uE7BA", () => _m.ShowProblems(p.Id)));
         if (st.PendingDeletes.Count > 0) menu.Items.Add(Item("Review deletions", "\uE74D", () => _m.ShowDeletions(p.Id)));
