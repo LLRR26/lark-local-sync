@@ -862,6 +862,10 @@ public sealed class CloudEngine
             deleteInLark.Clear();
             ConfirmDeletesSoon = true;
         }
+        // A folder delete that was approved and only half finished carries on without a new review: what's left of it
+        // is a subset of what was approved (the review rules still apply to every item).
+        var resumed = deleteInLark.Where(b => b.Kind == Kinds.Folder && b.Token != null && _resumeDeletes.ContainsKey(b.Token)).ToList();
+        deleteInLark.RemoveAll(resumed.Contains);
         var files = Math.Max(1, _b.Values.Count(b => b.Kind == Kinds.File));
         string? big = null;
         if (nHere > 200 && nHere > files / 2) big = "here:" + Fingerprint(deleteHere);
@@ -929,6 +933,13 @@ public sealed class CloudEngine
         }
         else if (big == _bigDeleteSeen || (big == null && _res.Full)) _bigDeleteSeen = null;
 
+        if (resumed.Count > 0)
+        {
+            reviewedEntries ??= new();
+            foreach (var r in resumed)
+                foreach (var kv in _resumeDeletes[r.Token!]) reviewedEntries[kv.Key] = kv.Value;
+            deleteInLark.AddRange(resumed);
+        }
         deleteHere.AddRange(copiesHere);
         deleteInLark.AddRange(copiesLark);
 
@@ -1076,12 +1087,15 @@ public sealed class CloudEngine
             }
             else msg = $"Can't {what}: {le.Message}";
         }
+        else if (msg == null && ex is DeleteIncompleteException) msg = ex.Message;
+        else if (msg == null && ex is IOException { InnerException: LarkApiException inner })
+            msg = $"Can't {what}: Lark said: {inner.LarkMessage}. It will be tried again.";
         else if (msg == null && ex is IOException io)
             msg = $"Can't {what}: the file is open in another app or Windows refused ({io.Message}). It will be tried again.";
         else if (msg == null && ex is UnauthorizedAccessException ua)
             msg = $"Can't {what}: Windows denied access ({ua.Message}).";
         else msg ??= $"Can't {what}: {ex?.Message}";
-        var retryIn = ex is IOException ? TimeSpan.FromMinutes(2) : _opt.RetryFailedAfter;
+        var retryIn = ex is IOException or DeleteIncompleteException ? TimeSpan.FromMinutes(2) : _opt.RetryFailedAfter;
         _failed[path] = (sigExtra + "|" + Sig(r, l), _opt.Now() + retryIn, msg);
         if (msg != null)
         {
@@ -1703,6 +1717,83 @@ public sealed class CloudEngine
         });
     }
 
+    // Lark struggles (HTTP 500, "resource contention") when many deletes hit one folder at once, so only a few
+    // delete requests run at the same time, however deep the recursion goes.
+    const int DeleteParallel = 3;
+    readonly SemaphoreSlim _deleteGate = new(DeleteParallel);
+    const int DeleteTries = 3;                                       // per item, for temporary errors
+    const int DeleteStreakLimit = 10;                                // this many failures in a row: Lark is not answering, stop and try later
+    const int DeleteNoticeFrom = 20;                                 // smaller folder deletes finish without a tray message
+    // An approved folder delete that didn't finish: folder token -> what was approved. The rest of it carries on
+    // next pass without a new review (what's left is a subset of what was approved).
+    readonly ConcurrentDictionary<string, Dictionary<string, RemoteEntry>> _resumeDeletes = new();
+    readonly ConcurrentDictionary<string, int> _deleteTotal = new();   // folder token -> items when first tried
+    readonly ConcurrentDictionary<string, bool> _deleteFailNotified = new(StringComparer.OrdinalIgnoreCase);
+
+    sealed class DeleteRun
+    {
+        public string Name = "";
+        public int Total, Done, Failures, Streak;
+        public volatile bool Abort;
+        public Exception? Last;
+        public string? LastName;
+    }
+
+    sealed class DeleteIncompleteException : Exception
+    {
+        public DeleteIncompleteException(string message) : base(message) { }
+    }
+
+    DeleteRun StartRun(BaseEntry b)
+    {
+        var total = 1 + _b.Values.Count(x => x.Token != null && _rTok.ContainsKey(x.Token)
+                                            && x.Path.StartsWith(b.Path + "/", StringComparison.OrdinalIgnoreCase));
+        var first = _deleteTotal.GetOrAdd(b.Token!, total);               // a carried-on delete counts what was deleted before
+        return new DeleteRun { Name = PathUtil.Name(b.Path), Total = Math.Max(first, total), Done = Math.Max(0, first - total) };
+    }
+
+    bool MarkDone(DeleteRun run)
+    {
+        var n = Interlocked.Increment(ref run.Done);
+        Volatile.Write(ref run.Streak, 0);
+        if (n % 25 == 0) Progress($"Deleting “{run.Name}” in Lark: {n:N0} of {Math.Max(n, run.Total):N0}…");
+        return true;
+    }
+
+    void Note(DeleteRun run, Exception ex, string? name = null)
+    {
+        run.Last = ex;
+        run.LastName = name;
+        Interlocked.Increment(ref run.Failures);
+        if (Interlocked.Increment(ref run.Streak) >= DeleteStreakLimit) run.Abort = true;
+    }
+
+    /// <summary>Deletes one item in Lark, trying a few times when Lark says "busy". An item that can't be deleted is
+    /// noted on the run (the rest carries on) instead of stopping everything. `top`: a refusal because of permissions on
+    /// the folder itself is thrown, so the caller can put it back on this PC.</summary>
+    bool TryDelete(DeleteRun run, string token, string type, string? name = null, bool top = false)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            _opt.Cancellation.ThrowIfCancellationRequested();
+            _deleteGate.Wait(_opt.Cancellation);
+            try
+            {
+                _remote.Delete(token, type);
+                return MarkDone(run);
+            }
+            catch (LarkApiException ex) when (ex.IsGone) { return MarkDone(run); }
+            catch (LarkApiException ex) when (top && ex.IsPermission) { throw; }
+            catch (Exception ex) when ((ex is LarkApiException { IsTransient: true } or LarkUnreachableException or HttpRequestException) && attempt < DeleteTries) { }
+            catch (Exception ex) when (ex is not (OperationCanceledException or NeedLoginException))
+            {
+                Note(run, ex, name);
+                return false;
+            }
+            finally { _deleteGate.Release(); }
+        }
+    }
+
     void DeleteOneInLark(BaseEntry b, Dictionary<string, RemoteEntry>? reviewedEntries)
     {
         {
@@ -1710,19 +1801,38 @@ public sealed class CloudEngine
             {
                 _opt.Cancellation.ThrowIfCancellationRequested();
                 if (_local.CheckPresence(b.Path) != LocalPresence.Missing) { BusyFilesWaiting = true; return; }
-                if (b.Kind == Kinds.Folder && reviewedEntries != null)
+                DeleteRun? run = null;
+                if (b.Kind == Kinds.Folder)
                 {
-                    if (!DeleteReviewedFolder(reviewedEntries[b.Token!], reviewedEntries, b.Path))
+                    run = StartRun(b);
+                    if (reviewedEntries != null && reviewedEntries.TryGetValue(b.Token!, out var snapshot))
                     {
-                        ConfirmDeletesSoon = true;
-                        return;
+                        _resumeDeletes[b.Token!] = reviewedEntries;
+                        if (DeleteReviewedFolder(snapshot, reviewedEntries, b.Path, run, top: true) == null)
+                        {
+                            _resumeDeletes.TryRemove(b.Token!, out _);       // a change since the review: it needs a new one
+                            ConfirmDeletesSoon = true;
+                            return;
+                        }
+                    }
+                    else DeleteFolderInLark(b.Token!, b.Path, run, top: true);
+                    if (run.Failures > 0 || run.Abort)
+                    {
+                        var said = run.Last is LarkApiException la ? la.LarkMessage : run.Last?.Message;
+                        throw new DeleteIncompleteException($"Couldn't finish deleting “{run.Name}” in Lark: {Math.Min(run.Done, run.Total):N0} of {run.Total:N0} items deleted. " +
+                                                            $"Lark said: {said}{(run.LastName != null ? $" (on “{run.LastName}”)" : "")}. It will be tried again in a few minutes.");
                     }
                 }
-                else if (b.Kind == Kinds.Folder) DeleteFolderInLark(b.Token!, b.Path);
                 else _remote.Delete(b.Token!, b.RType ?? "file");
                 _index.Remove(b.Token!);
                 _state.RemoveTree(b.Path);
-                lock (_resLock) _res.DeletedRemote++;
+                lock (_resLock)
+                {
+                    _res.DeletedRemote++;
+                    if (run != null && (run.Total > DeleteNoticeFrom || _deleteFailNotified.ContainsKey(b.Path)))
+                        _res.Notices.Add($"Deleted “{run.Name}” in Lark ({run.Total:N0} items are in Lark's trash).");
+                }
+                if (b.Kind == Kinds.Folder) { _resumeDeletes.TryRemove(b.Token!, out _); _deleteTotal.TryRemove(b.Token!, out _); _deleteFailNotified.TryRemove(b.Path, out _); }
                 Log.Info($"Deleted in Lark (moved to Lark's trash): {b.Path}");
             }
             catch (LarkApiException ex) when (ex.IsGone) { _state.RemoveTree(b.Path); }
@@ -1734,13 +1844,22 @@ public sealed class CloudEngine
                     _res.Info[b.Path] = "You can only view this in Lark, so it can't be deleted there. It has been put back on this PC.";
                 Log.Info($"{b.Path}: view only in Lark ({ex.Message}); putting it back");
             }
-            catch (Exception ex) { Fail(b.Path, ex, "delete this item in Lark"); }
+            catch (Exception ex)
+            {
+                // Shown once as a tray message; the retries after that only update the Problems list.
+                if (ex is DeleteIncompleteException && _deleteFailNotified.TryAdd(b.Path, true))
+                    lock (_resLock) _res.Notices.Add(ex.Message);
+                else if (ex is not DeleteIncompleteException) _resumeDeletes.TryRemove(b.Token ?? "", out _);
+                Fail(b.Path, ex, "delete this item in Lark");
+            }
         }
     }
 
     // Work from the approved snapshot. A direct delete of a populated folder would also
     // trash children added after review. Only send a folder delete after an empty listing.
-    bool DeleteReviewedFolder(RemoteEntry folder, Dictionary<string, RemoteEntry> reviewed, string localRoot)
+    // Returns null when something changed since the review (the rest is left alone for a new review), false when
+    // something inside couldn't be deleted (noted on the run; the folder stays), true when the folder is gone.
+    bool? DeleteReviewedFolder(RemoteEntry folder, Dictionary<string, RemoteEntry> reviewed, string localRoot, DeleteRun run, bool top = false)
     {
         var children = _remote.ListFolder(folder.Token);
         foreach (var child in children)
@@ -1748,78 +1867,76 @@ public sealed class CloudEngine
             if (!reviewed.TryGetValue(child.Token, out var expected) || expected.ParentToken != folder.Token
                 || expected.Type != child.Type || expected.MTime != child.MTime
                 || expected.Path != PathUtil.Join(folder.Path, child.Path))
-                return false;
+                return null;
         }
-        if (children is RemoteListing { Incomplete: true }) return false;      // there may be more in it than we can see
-        // The children go several at a time. Any "no" (the PC copy is back, something changed) stops the rest from
+        if (children is RemoteListing { Incomplete: true }) return null;       // there may be more in it than we can see
+        // The children go a few at a time. Any "no" (the PC copy is back, something changed) stops the rest from
         // starting; items already sent to Lark's trash stay there, and the folder itself is then left alone.
-        var stopped = false;
-        var errors = new ConcurrentBag<Exception>();
-        var options = new ParallelOptions { MaxDegreeOfParallelism = Math.Clamp(_opt.MaxTransfers, 1, 8), CancellationToken = _opt.Cancellation };
+        // An item Lark won't delete (after a few tries) doesn't stop the others; it's counted and tried again next pass.
+        bool stopped = false, incomplete = false;
+        var options = new ParallelOptions { MaxDegreeOfParallelism = DeleteParallel, CancellationToken = _opt.Cancellation };
         Parallel.ForEach(children, options, (child, state) =>
         {
-            if (Volatile.Read(ref stopped)) return;
+            if (Volatile.Read(ref stopped) || run.Abort) return;
             try
             {
                 _opt.Cancellation.ThrowIfCancellationRequested();
-                if (_local.CheckPresence(localRoot) != LocalPresence.Missing
-                    || (child.IsFolder && !DeleteReviewedFolder(reviewed[child.Token], reviewed, localRoot)))
+                var outcome = _local.CheckPresence(localRoot) != LocalPresence.Missing ? (bool?)null
+                    : child.IsFolder ? DeleteReviewedFolder(reviewed[child.Token], reviewed, localRoot, run)
+                    : TryDelete(run, child.Token, child.Type, reviewed[child.Token].Path);
+                if (outcome == null)
                 {
                     Volatile.Write(ref stopped, true);
                     state.Stop();
-                    return;
                 }
-                if (!child.IsFolder) _remote.Delete(child.Token, child.Type);
+                else if (outcome == false) Volatile.Write(ref incomplete, true);
             }
-            catch (OperationCanceledException) when (_opt.Cancellation.IsCancellationRequested) { throw; }
-            catch (LarkApiException ex) when (ex.IsGone) { }
-            catch (LarkApiException ex) when (ex.IsPermission)
-            {
-                errors.Add(new IOException($"Couldn't remove reviewed item {reviewed[child.Token].Path}: {ex.Message}", ex));
-                state.Stop();
-            }
-            catch (Exception ex) { errors.Add(ex); state.Stop(); }
+            catch (Exception ex) when (ex is not (OperationCanceledException or NeedLoginException)) { Note(run, ex); Volatile.Write(ref incomplete, true); }
         });
-        if (!errors.IsEmpty) throw errors.First();
-        if (stopped) return false;
-        if (children.Count > 0 && _remote.ListFolder(folder.Token).Count > 0) return false;
-        if (_local.CheckPresence(localRoot) != LocalPresence.Missing) return false;
-        _remote.Delete(folder.Token, Kinds.Folder);
-        return true;
+        if (stopped) return null;
+        if (incomplete || run.Abort) return false;                             // the folder stays until its contents are gone
+        if (children.Count > 0 && _remote.ListFolder(folder.Token).Count > 0) return null;
+        if (_local.CheckPresence(localRoot) != LocalPresence.Missing) return null;
+        return TryDelete(run, folder.Token, Kinds.Folder, folder.Path, top);
     }
 
     /// <summary>Delete a Lark folder. Lark refuses very big folders in one request (server error 500), so then
-    /// what's inside is deleted first – several items at a time, big sub-folders again in parts – and the
-    /// empty folder last. Everything still goes to Lark's trash.</summary>
-    void DeleteFolderInLark(string token, string path)
+    /// what's inside is deleted first – a few items at a time, big sub-folders again in parts – and the
+    /// empty folder last. Everything still goes to Lark's trash. Items Lark won't delete are counted on the run.</summary>
+    /// <returns>true when the folder is gone; false when something inside couldn't be deleted (noted on the run).</returns>
+    bool DeleteFolderInLark(string token, string path, DeleteRun run, bool top = false)
     {
         try
         {
-            _remote.Delete(token, "folder");
-            return;
+            _deleteGate.Wait(_opt.Cancellation);
+            try { _remote.Delete(token, "folder"); }
+            finally { _deleteGate.Release(); }
+            return MarkDone(run);
         }
-        catch (LarkApiException ex) when (ex.Code >= 500 && ex.Code < 600)
+        catch (LarkApiException ex) when ((ex.Code >= 500 && ex.Code < 600) || ex.Code == LarkApiException.ContentionCode)
         {
             Log.Info($"Lark couldn't delete “{path}” in one go ({ex.Message}); deleting what's inside it first");
         }
         var kids = _remote.ListFolder(token);
         if (kids is RemoteListing { Incomplete: true })
-            throw new IOException($"“{path}” has items in Lark that couldn't be listed; not deleting it (the next check tries again)");
-        var errors = new ConcurrentBag<Exception>();
-        Parallel.ForEach(kids, new ParallelOptions { MaxDegreeOfParallelism = Math.Clamp(_opt.MaxTransfers, 1, 8) }, k =>
+            throw new DeleteIncompleteException($"Couldn't finish deleting “{PathUtil.Name(path)}” in Lark: it has items that couldn't be listed yet. It will be tried again in a few minutes.");
+        var incomplete = false;                       // this folder's own contents (not other folders of the same run)
+        Parallel.ForEach(kids, new ParallelOptions { MaxDegreeOfParallelism = DeleteParallel, CancellationToken = _opt.Cancellation }, k =>
         {
+            if (run.Abort) return;
             try
             {
-                if (k.IsFolder) DeleteFolderInLark(k.Token, PathUtil.Join(path, k.Name));
-                else _remote.Delete(k.Token, k.Type);
+                var gone = k.IsFolder ? DeleteFolderInLark(k.Token, PathUtil.Join(path, k.Name), run)
+                                      : TryDelete(run, k.Token, k.Type, PathUtil.Join(path, k.Name));
+                if (!gone) Volatile.Write(ref incomplete, true);
             }
             catch (LarkApiException ex) when (ex.IsGone) { }
-            // Not a LarkApiException: a refusal on ONE item inside must not make the caller treat the whole folder as
-            // view only and put it back. It becomes a plain failure and the next check retries.
-            catch (Exception ex) { errors.Add(new IOException($"couldn't delete “{PathUtil.Join(path, k.Name)}” in Lark: {ex.Message}", ex)); }
+            // A refusal on ONE item inside must not make the caller treat the whole folder as view only and put it
+            // back: it is noted, the rest carries on and the next check retries.
+            catch (Exception ex) when (ex is not (OperationCanceledException or NeedLoginException)) { Note(run, ex); Volatile.Write(ref incomplete, true); }
         });
-        if (!errors.IsEmpty) throw errors.First();
-        _remote.Delete(token, "folder");
+        if (incomplete || run.Abort) return false;
+        return TryDelete(run, token, "folder", path, top);
     }
 
     /// <summary>"Put them back" for deletions held for review. Deleted on the PC: shown again from Lark.

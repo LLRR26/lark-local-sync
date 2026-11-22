@@ -402,6 +402,7 @@ public sealed class PairRunner : IDisposable
             if (res.PendingDeletes.Count > 0 || res.Full) _status.PendingDeletes = res.PendingDeletes.ToList();
         }
         if (res.Changed) Log.Info($"{Pair.Label}: {res.Summary()} ({took.TotalSeconds:0.0}s)");
+        foreach (var notice in res.Notices) NeedsAttention?.Invoke(notice);
         if (res.Conflicts.Count > 0)
             NeedsAttention?.Invoke($"{res.Conflicts.Count} file(s) in “{Pair.Label}” were changed here and in Lark. Both versions were kept.");
 

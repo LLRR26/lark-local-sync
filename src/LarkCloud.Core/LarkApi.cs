@@ -7,7 +7,7 @@ namespace LarkCloud.Core;
 
 public sealed class LarkApiException : Exception
 {
-    static readonly HashSet<long> PermissionCodes = new() { 1061004, 1062501, 1061045, 1063001, 99991672, 99991679 };
+    static readonly HashSet<long> PermissionCodes = new() { 1061004, 1062501, 1063001, 99991672, 99991679 };
     public static readonly HashSet<long> GoneCodes = new() { 1061007, 1061003 };
 
     public long Code { get; }
@@ -26,6 +26,12 @@ public sealed class LarkApiException : Exception
     public bool IsBlocked => Code == 403;
 
     public bool IsGone => GoneCodes.Contains(Code);
+
+    /// <summary>Lark's "resource contention, please retry" (often while many deletes hit one folder).</summary>
+    public const long ContentionCode = 1061045;
+
+    /// <summary>Trying again later can work: rate limit, server error, or Lark's resource contention.</summary>
+    public bool IsTransient => Code == 429 || Code == ContentionCode || (Code >= 500 && Code <= 599);
 
     public bool IsPermission
     {
@@ -225,6 +231,12 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
                     r.Dispose();
                     continue;
                 }
+            }
+            if (code == LarkApiException.ContentionCode && attempt < 5)
+            {
+                r.Dispose();
+                Backoff(attempt, "resource contention", ct);
+                continue;
             }
             var message = (string?)body["msg"] ?? r.ReasonPhrase ?? "";
             r.Dispose();
@@ -428,7 +440,7 @@ public sealed class LarkApi : IRemoteDrive, ILarkExtras
                 return tok;
             }
             catch (LarkApiException ex) when (!ex.IsPermission && !ex.EmptyRefused && !ex.IsBlocked && !ex.IsGone
-                                              && ex.Code != 429 && ex.Code != RateLimit && !(ex.Code >= 500 && ex.Code <= 599))
+                                              && ex.Code != 429 && ex.Code != RateLimit && ex.Code != LarkApiException.ContentionCode && !(ex.Code >= 500 && ex.Code <= 599))
             {
                 // Overwrite-in-place (keeps the link and history) isn't available on every tenant:
                 // fall back to upload as new + move the old one to the Lark trash.

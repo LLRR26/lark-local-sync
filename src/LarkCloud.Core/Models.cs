@@ -102,6 +102,7 @@ public sealed class SyncResult
     public Dictionary<string, string?> UploadHere { get; } = new();    // blocked path -> its Lark folder link
     public List<string> Notes { get; } = new();                        // non-file problems (duplicate names, ...)
     public List<PendingDelete> PendingDeletes { get; } = new();
+    public List<string> Notices { get; } = new();                      // worth a tray message (e.g. a big folder finished deleting in Lark)
     public Dictionary<string, string> Info { get; } = new();             // path -> "good to know" (not a problem)
     public Dictionary<string, string?> OpenLinks { get; } = new();       // path -> Lark page to open (e.g. to ask for access)
     public bool ViewOnly { get; set; }                                   // the person can only view this Lark folder
