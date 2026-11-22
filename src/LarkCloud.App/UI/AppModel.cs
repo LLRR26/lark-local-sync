@@ -57,8 +57,8 @@ internal sealed record StatusSummary(Tone Tone, string Glyph, string Sentence, s
         var pairs = m.Pairs();
         var sts = pairs.Select(p => (Pair: p, St: m.StatusOf(p.Id))).ToList();
         var problems = sts.Sum(x => x.St.Items.Count);
-        var dels = sts.Sum(x => x.St.PendingDeletes.Count);
-        var delPair = sts.FirstOrDefault(x => x.St.PendingDeletes.Count > 0).Pair?.Id;
+        var dels = sts.Where(x => !x.St.Deleting).Sum(x => x.St.PendingDeletes.Count);        // not while an approved deletion runs
+        var delPair = sts.FirstOrDefault(x => !x.St.Deleting && x.St.PendingDeletes.Count > 0).Pair?.Id;
         StatusSummary Make(Tone t, string g, string sentence, string detail, bool paused = false) =>
             new(t, g, sentence, detail, problems, dels, delPair, pairs.Count > 0, paused);
 

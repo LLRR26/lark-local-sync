@@ -190,7 +190,7 @@ internal sealed partial class FoldersPage : UserControl, IPage
         menu.Items.Add(Item("Check often\u2026", "\uE72C", () => new CheckOftenDialog(_m.Settings, p) { Owner = Owner }.ShowDialog()));
         if (st.Items.Count > 0 || st.Info.Count > 0 || st.PendingDeletes.Count > 0) menu.Items.Add(new Separator());
         if (st.Items.Count > 0 || st.Info.Count > 0) menu.Items.Add(Item("Files that can't sync", "\uE7BA", () => _m.ShowProblems(p.Id)));
-        if (st.PendingDeletes.Count > 0) menu.Items.Add(Item("Review deletions", "\uE74D", () => _m.ShowDeletions(p.Id)));
+        if (st.PendingDeletes.Count > 0 && !st.Deleting) menu.Items.Add(Item("Review deletions", "\uE74D", () => _m.ShowDeletions(p.Id)));
         if (!_m.LockFolders && !p.FromIt)
         {
             menu.Items.Add(new Separator());

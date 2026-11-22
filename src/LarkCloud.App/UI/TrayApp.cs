@@ -191,7 +191,7 @@ internal sealed class TrayApp : IAppModel, IDisposable
     public void ShowDeletions(string pairId) => Ui_(() =>
     {
         if (_modalOpen) return;
-        if (_svc.StatusOf(pairId).PendingDeletes.Count == 0) return;     // already decided
+        if (_svc.StatusOf(pairId) is { PendingDeletes.Count: 0 } or { Deleting: true }) return;     // already decided
         ShowModal(new DeletionsDialog(this, pairId));
     });
     public void OpenCheck() => Ui_(() => ShowOnce("check", () => new CheckDialog(run => FeatureCheck.Run(_svc, run), _svc.Auth.UserName)));

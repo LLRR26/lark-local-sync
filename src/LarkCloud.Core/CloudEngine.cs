@@ -899,17 +899,38 @@ public sealed class CloudEngine
             }
             var rows = deleteHere.Select(p => new PendingDelete { Path = p, InLark = false })
                 .Concat(deleteInLark.Select(b => new PendingDelete { Path = b.Path, InLark = true })).ToList();
-            var detail = deleteHere.Select(p =>
+            // Folder dates are left out on purpose: Lark updates a folder's modified_time lazily and unpredictably (a live
+            // probe showed the folder holding a new file keeping its date while its parent and grandparent changed 20 s and
+            // 2 min later), so they would change between the review and the approval pass. Items (token, path, type, parent)
+            // and FILE versions still count: a new or edited file inside needs a new review.
+            var lines = deleteHere.Select(p =>
             {
                 var l = _l[p];
-                return System.Text.Json.JsonSerializer.Serialize(new { Side = "PC", l.Path, l.Identity, l.Size, l.MTime, l.InSync, l.OnDisk });
+                return (p, System.Text.Json.JsonSerializer.Serialize(new { Side = "PC", l.Path, l.Identity, l.Size, l.MTime, l.InSync, l.OnDisk }));
             }).Concat(deleteInLark.Select(b =>
-                System.Text.Json.JsonSerializer.Serialize(new { Side = "Lark", b.Path, b.Token, Version = _r.GetValueOrDefault(b.Path)?.MTime })))
+                (b.Path, System.Text.Json.JsonSerializer.Serialize(new { Side = "Lark", b.Path, b.Token, Version = b.Kind == Kinds.Folder ? null : _r.GetValueOrDefault(b.Path)?.MTime }))))
               .Concat(affectedRemote.Values.Where(Affected).Select(e =>
-                System.Text.Json.JsonSerializer.Serialize(new { Side = "Contents", e.Path, e.Type, e.Token, e.MTime, e.ParentToken })));
-            var signature = Fingerprint(detail, preserveCase: true);
-            if (rows.Count > 0 && (!_res.Full || approvedDeletes != signature))
+                (e.Path, System.Text.Json.JsonSerializer.Serialize(new { Side = "Contents", e.Path, e.Type, e.Token, MTime = e.IsFolder ? null : e.MTime, e.ParentToken }))))
+              .ToList();
+            var signature = Fingerprint(lines.Select(x => x.Item2), preserveCase: true);
+            if (_res.Full && rows.Count > 0)
             {
+                if (_reviewed.Count > 8) _reviewed.Clear();
+                _reviewed[signature] = (lines.Select(x => x.Item2).ToHashSet(), lines.Select(x => x.Item1).ToHashSet());
+            }
+            // Items that are gone by now (an earlier partial run deleted them) leave a subset of what was approved: still fine.
+            var approved = approvedDeletes == signature
+                || (approvedDeletes != null && _reviewed.TryGetValue(approvedDeletes, out var was) && lines.All(x => was.Lines.Contains(x.Item2)));
+            if (rows.Count > 0 && (!_res.Full || !approved))
+            {
+                if (_res.Full && approvedDeletes != null)
+                {
+                    var names = _reviewed.TryGetValue(approvedDeletes, out var old)
+                        ? lines.Where(x => !old.Lines.Contains(x.Item2)).Select(x => $"{x.Item1} ({(old.Paths.Contains(x.Item1) ? "changed" : "new")})").Distinct().ToList()
+                        : new List<string>();
+                    Log.Warn($"The approved deletions were not applied: {(names.Count > 0 ? $"{names.Count:N0} item{(names.Count == 1 ? "" : "s")} in Lark changed since the review: {string.Join(", ", names.Take(3))}{(names.Count > 3 ? ", …" : "")}" : "they changed since the review")}");
+                    _res.Notices.Add(ChangedSinceReview);
+                }
                 _reviewRequired = true;
                 foreach (var row in rows)
                     _res.PendingDeletes.Add(new PendingDelete { Path = row.Path, InLark = row.InLark, Approval = signature });
@@ -1727,6 +1748,10 @@ public sealed class CloudEngine
     // An approved folder delete that didn't finish: folder token -> what was approved. The rest of it carries on
     // next pass without a new review (what's left is a subset of what was approved).
     readonly ConcurrentDictionary<string, Dictionary<string, RemoteEntry>> _resumeDeletes = new();
+    // What each recent review looked like (its signature -> detail lines and paths), so an approval can be checked
+    // against it and a mismatch can say what changed.
+    readonly Dictionary<string, (HashSet<string> Lines, HashSet<string> Paths)> _reviewed = new();
+    public const string ChangedSinceReview = "Lark changed since you reviewed these deletions – please review again.";
     readonly ConcurrentDictionary<string, int> _deleteTotal = new();   // folder token -> items when first tried
     readonly ConcurrentDictionary<string, bool> _deleteFailNotified = new(StringComparer.OrdinalIgnoreCase);
 
@@ -1812,6 +1837,8 @@ public sealed class CloudEngine
                         {
                             _resumeDeletes.TryRemove(b.Token!, out _);       // a change since the review: it needs a new one
                             ConfirmDeletesSoon = true;
+                            Log.Warn($"“{b.Path}” was not deleted: Lark changed since the review");
+                            lock (_resLock) _res.Notices.Add(ChangedSinceReview);
                             return;
                         }
                     }
@@ -1864,10 +1891,14 @@ public sealed class CloudEngine
         var children = _remote.ListFolder(folder.Token);
         foreach (var child in children)
         {
+            // Folder dates are ignored (Lark updates them lazily; see Decide); files must still be the reviewed version.
             if (!reviewed.TryGetValue(child.Token, out var expected) || expected.ParentToken != folder.Token
-                || expected.Type != child.Type || expected.MTime != child.MTime
+                || expected.Type != child.Type || (!child.IsFolder && expected.MTime != child.MTime)
                 || expected.Path != PathUtil.Join(folder.Path, child.Path))
+            {
+                Log.Warn($"“{PathUtil.Join(folder.Path, child.Path)}” in Lark {(reviewed.ContainsKey(child.Token) ? "changed" : "is new")} since the review");
                 return null;
+            }
         }
         if (children is RemoteListing { Incomplete: true }) return null;       // there may be more in it than we can see
         // The children go a few at a time. Any "no" (the PC copy is back, something changed) stops the rest from

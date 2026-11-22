@@ -94,4 +94,57 @@ public class BigFolderDeleteTests
         Assert.Empty(e.Remote.Paths());
         Assert.Contains("Deleted “big” in Lark", Assert.Single(res.Notices));
     }
+
+    // ---- the approval must survive Lark's lazily changing folder dates, but not real changes
+
+    [Fact]
+    public void Approval_survives_changed_folder_dates_and_items_already_gone()
+    {
+        using var e = Setup(true);
+        var review = Assert.Single(e.Sync().PendingDeletes);
+        foreach (var n in e.Remote.Nodes.Values.Where(n => n.Type == Kinds.Folder && n.Token != e.Remote.MyRoot)) n.MTime = e.Remote.Tick();
+        e.Remote.RemovePath("big/sub0/f0.txt");                       // an earlier partial run took some away
+        e.Remote.RemovePath("big/sub2/f3.txt");
+        var res = e.Sync(approvedDeletes: review.Approval);
+        Assert.Empty(res.Failed);
+        Assert.Empty(res.PendingDeletes);
+        Assert.Empty(e.Remote.Paths());
+        Assert.Contains("Deleted “big” in Lark", Assert.Single(res.Notices));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void A_new_or_edited_file_after_the_review_is_not_deleted_and_says_so(bool edit)
+    {
+        using var e = Setup(true);
+        var review = Assert.Single(e.Sync().PendingDeletes);
+        var changed = false;
+        e.Remote.DeleteFault = _ =>
+        {
+            // Lark changes while the approved delete runs (after the approval pass looked at everything)
+            if (!changed) { changed = true; if (edit) e.Remote.Edit("big/sub5/f0.txt", new byte[] { 1 }); else e.Remote.AddFile("big/sub5/new.txt", new byte[] { 1 }); }
+            return null;
+        };
+        var res = e.Sync(approvedDeletes: review.Approval);
+        Assert.Contains(CloudEngine.ChangedSinceReview, res.Notices);
+        Assert.Contains("big/sub5", e.Remote.Paths());
+        Assert.Contains(edit ? "big/sub5/f0.txt" : "big/sub5/new.txt", e.Remote.Paths());
+        Assert.Contains("big", e.Remote.Paths());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void A_file_changed_before_the_approval_pass_goes_back_to_review(bool edit)
+    {
+        using var e = Setup(true);
+        var review = Assert.Single(e.Sync().PendingDeletes);
+        if (edit) e.Remote.Edit("big/sub1/f1.txt", new byte[] { 9 }); else e.Remote.AddFile("big/sub1/new.txt", new byte[] { 9 });
+        var res = e.Sync(approvedDeletes: review.Approval);
+        Assert.Contains(edit ? "big/sub1/f1.txt" : "big/sub1/new.txt", e.Remote.Paths());      // never deleted
+        Assert.Empty(res.Failed);
+        Assert.Single(res.PendingDeletes);                                                     // back in Review
+        Assert.Contains(CloudEngine.ChangedSinceReview, res.Notices);
+    }
 }

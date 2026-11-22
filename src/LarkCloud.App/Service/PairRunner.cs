@@ -17,12 +17,13 @@ public sealed class PairStatus
     public List<(string Rel, string Msg)> Info = new();           // good to know, not a problem
     public Dictionary<string, string?> OpenLinks = new(StringComparer.OrdinalIgnoreCase);
     public bool ViewOnly;
+    public bool Deleting;                                          // Delete was clicked in Review and the deletion hasn't ended
     public int Downloading;
     public PairStatus Clone() => new()
     {
         State = State, Message = Message, LastFull = LastFull, Items = Items.ToList(),
         UploadHere = new(UploadHere, StringComparer.OrdinalIgnoreCase), PendingDeletes = PendingDeletes.ToList(), Downloading = Downloading,
-        Info = Info.ToList(), OpenLinks = new(OpenLinks, StringComparer.OrdinalIgnoreCase), ViewOnly = ViewOnly,
+        Info = Info.ToList(), OpenLinks = new(OpenLinks, StringComparer.OrdinalIgnoreCase), ViewOnly = ViewOnly, Deleting = Deleting,
     };
 }
 
@@ -98,7 +99,15 @@ public sealed class PairRunner : IDisposable
     /// <summary>"Sync now" clicked: same full check, but its progress is shown instead of running quietly.</summary>
     public void SyncNowByUser() { lock (_lock) { _fullRequested = true; _manual = true; } _wake.Set(); }
     public void RetryFailed() { lock (_lock) { _retryFailed = true; _fullRequested = true; } _wake.Set(); }
-    public void AllowDeletes(string approval) { lock (_lock) { _approvedDeletes = approval; _fullRequested = true; } _wake.Set(); }
+    public void AllowDeletes(string approval)
+    {
+        int n;
+        lock (_lock) { _approvedDeletes = approval; _fullRequested = true; _manual = true; _status.Deleting = true; n = _status.PendingDeletes.Count; }
+        // Busy right away: the full check before the deletion takes minutes on a big drive, and without this the
+        // status would keep saying "waiting for you to confirm" with no sign of work.
+        SetStatus(SyncState.Syncing, $"Getting ready to delete {n:N0} item{(n == 1 ? "" : "s")} – checking Lark first…");
+        _wake.Set();
+    }
     public void RestoreDeletes() { lock (_lock) { _restore = true; _fullRequested = true; } _wake.Set(); }
     public void FreeUpSpaceNow() { _freeAll = true; _maintWake.Set(); }
     public void SetPaused(bool paused) { Pair.Paused = paused; if (!paused) SyncNow(); else _wake.Set(); }
@@ -311,7 +320,7 @@ public sealed class PairRunner : IDisposable
                 }
                 var t0 = DateTime.UtcNow;
                 _showProgress = manual;
-                if (manual) SetStatus(SyncState.Syncing, "Checking for changes…");
+                if (manual && approval == null) SetStatus(SyncState.Syncing, "Checking for changes…");
                 SyncResult res;
                 // A full check may pause when quick work is ready (never when it has to apply deletions / restore).
                 Func<bool>? yield = full && approval == null && !restore ? QuickWorkReady : null;
@@ -395,6 +404,7 @@ public sealed class PairRunner : IDisposable
         lock (_lock)
         {
             _status.Items = items;
+            _status.Deleting = _approvedDeletes != null;
             _status.UploadHere = new(res.UploadHere, StringComparer.OrdinalIgnoreCase);
             _status.OpenLinks = new(res.OpenLinks, StringComparer.OrdinalIgnoreCase);
             _status.Info = res.Info.Select(kv => (kv.Key, kv.Value)).OrderBy(x => x.Key).ToList();
@@ -407,7 +417,8 @@ public sealed class PairRunner : IDisposable
             NeedsAttention?.Invoke($"{res.Conflicts.Count} file(s) in “{Pair.Label}” were changed here and in Lark. Both versions were kept.");
 
         var st = Status;
-        if (st.PendingDeletes.Count > 0)
+        if (st.Deleting) { }                                           // an approved delete is still on its way: keep showing it working
+        else if (st.PendingDeletes.Count > 0)
             SetStatus(SyncState.Attention, $"{st.PendingDeletes.Count:N0} deletions waiting for you to confirm");
         else if (res.Failed.Count > 0)
             SetStatus(SyncState.Attention, $"{res.Failed.Count:N0} file{(res.Failed.Count == 1 ? "" : "s")} can't sync – click to see which");
