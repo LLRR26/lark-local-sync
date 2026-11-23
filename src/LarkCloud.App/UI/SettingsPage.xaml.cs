@@ -2,6 +2,7 @@ using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Input;
+using LarkCloud.App.Service;
 using LarkCloud.Core;
 
 namespace LarkCloud.App.UI;
@@ -17,6 +18,9 @@ internal sealed partial class SettingsPage : UserControl, IPage
     TextBox _ignoreBox = null!;
     TextBlock _ignoreError = null!;
     Config Cfg => _m.Settings;
+    Button _checkUpdates = null!, _restartNow = null!;
+    Spinner _updateBusy = null!;
+    TextBlock _updateStatus = null!;
 
     public SettingsPage(IAppModel model)
     {
@@ -54,6 +58,23 @@ internal sealed partial class SettingsPage : UserControl, IPage
         var docs = Combo("Offline doc copies as", new[] { ("Word, Excel & PowerPoint files", "office"), ("PDF files", "pdf") }, Cfg.DocCopyFormat, v => Put(() => Cfg.SetMine(Config.KeyDocFormat, v)));
         Lock(Config.KeyDocFormat, docs);
         Card(Rows, "Offline doc copies as", "The file type for offline copies of Lark docs. You turn copies on for each folder in its ⋯ menu.", docs, Cfg.IsLocked(Config.KeyDocFormat));
+
+        // ---- updates (never locked: updates always apply to everyone)
+        _checkUpdates = new Button { Content = "Check for updates" };
+        _checkUpdates.Click += async (_, _) => await _m.CheckForUpdates();
+        _restartNow = new Button { Content = "Restart now", Visibility = Visibility.Collapsed };
+        _restartNow.Click += (_, _) => _m.RestartToUpdate();
+        var versionLine = Card(Rows, "Updates", $"Version {AppPaths.Version}", Row(_restartNow, _checkUpdates), false);
+        _updateBusy = new Spinner { Width = 16, Height = 16, Margin = new Thickness(0, 0, 8, 0), Visibility = Visibility.Collapsed };
+        _updateStatus = new TextBlock { Style = (Style)FindResource("CaptionText"), VerticalAlignment = VerticalAlignment.Center };
+        AutomationProperties.SetLiveSetting(_updateStatus, AutomationLiveSetting.Polite);
+        var statusRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 4, 0, 0) };
+        statusRow.Children.Add(_updateBusy);
+        statusRow.Children.Add(_updateStatus);
+        ((StackPanel)versionLine.Parent).Children.Add(statusRow);
+        void OnUpdate() => Dispatcher.BeginInvoke(ShowUpdate);
+        Loaded += (_, _) => { _m.UpdateChanged += OnUpdate; ShowUpdate(); };     // the page lives as long as the window; listen only while it is shown
+        Unloaded += (_, _) => _m.UpdateChanged -= OnUpdate;
 
         // ---- advanced
         var confirm = Toggle("Ask before deleting many items", Cfg.ConfirmMassDeletes);
@@ -144,13 +165,14 @@ internal sealed partial class SettingsPage : UserControl, IPage
         return p;
     }
 
-    void Card(Panel into, string title, string description, FrameworkElement control, bool locked)
+    TextBlock Card(Panel into, string title, string description, FrameworkElement control, bool locked)
     {
         AutomationProperties.SetName(control, title);
         if (locked) AutomationProperties.SetHelpText(control, "Set by your IT team");
         var text = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
         text.Children.Add(new TextBlock { Text = title, Style = (Style)FindResource("BodyText") });
-        text.Children.Add(new TextBlock { Text = description, Style = (Style)FindResource("CaptionText"), Margin = new Thickness(0, 2, 0, 0) });
+        var desc = new TextBlock { Text = description, Style = (Style)FindResource("CaptionText"), Margin = new Thickness(0, 2, 0, 0) };
+        text.Children.Add(desc);
         if (locked) text.Children.Add(LockLine());
         control.VerticalAlignment = VerticalAlignment.Center;
         control.Margin = new Thickness(24, 0, 0, 0);
@@ -161,6 +183,22 @@ internal sealed partial class SettingsPage : UserControl, IPage
         Grid.SetColumn(control, 1);
         grid.Children.Add(control);
         into.Children.Add(new Border { Style = (Style)FindResource("Card"), Padding = new Thickness(16, 12, 16, 12), MinHeight = 64, Margin = new Thickness(0, 0, 0, 4), Child = grid });
+        return desc;
+    }
+
+    void ShowUpdate()
+    {
+        var u = _m.UpdateStatus;
+        _checkUpdates.IsEnabled = !u.Checking;
+        _updateBusy.Visibility = u.Checking ? Visibility.Visible : Visibility.Collapsed;
+        _restartNow.Visibility = u.Installed != null ? Visibility.Visible : Visibility.Collapsed;
+        var ago = u.LastChecked is { } t ? $"Last checked {Ui.Ago(t)}" : "";
+        _updateStatus.Text =
+            u.Checking ? "Checking…"
+            : u.Installed is { } v ? $"Version {v} downloaded – restart to use it."
+            : u.Last is { Outcome: UpdateOutcome.Failed or UpdateOutcome.Unavailable } f ? $"Couldn't check for updates: {f.Reason}"
+            : u.Last is { Outcome: UpdateOutcome.UpToDate } ? $"You have the latest version. {ago}"
+            : ago.Length > 0 ? ago : "Checked automatically in the background.";
     }
 
     // ---------------------------------------------------------------- files never to sync
@@ -259,5 +297,6 @@ internal sealed partial class SettingsPage : UserControl, IPage
     public void Refresh()
     {
         if (_startup.IsChecked != _m.StartsWithWindows) _startup.IsChecked = _m.StartsWithWindows;
+        ShowUpdate();       // keeps "Last checked …" current
     }
 }

@@ -118,6 +118,16 @@ internal sealed class PreviewModel : IAppModel
     public void OpenCheck() { }
     public void OpenLog() { }
 
+    public UpdateStatus UpdateStatus { get; private set; } = new(false, null, null, null);
+    public event Action? UpdateChanged;
+    public async Task CheckForUpdates()
+    {
+        UpdateStatus = UpdateStatus with { Checking = true }; UpdateChanged?.Invoke();
+        await Task.Delay(1200);
+        UpdateStatus = new(false, DateTime.UtcNow, new(UpdateOutcome.UpToDate, AppPaths.Version), null); UpdateChanged?.Invoke();
+    }
+    public void RestartToUpdate() { }
+
     // ---------------------------------------------------------------- entry point
     [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out RECT r, int size);
     [StructLayout(LayoutKind.Sequential)] struct RECT { public int L, T, R, B; }
@@ -185,7 +195,7 @@ internal sealed class PreviewModel : IAppModel
                 // A blank themed area with the real tray menu opened 40 px in from its top-left corner.
                 var blank = new Window { Width = 360, Height = 340, WindowStyle = WindowStyle.None, ResizeMode = ResizeMode.NoResize, ShowInTaskbar = false };
                 blank.SetResourceReference(Window.BackgroundProperty, "BackdropBrush");
-                var tm = new TrayMenu(() => { var s = StatusSummary.Of(model); return (s.Sentence, s.Glyph); }, model.Pairs, () => { }, () => { }, () => { }, () => { });
+                var tm = new TrayMenu(() => { var s = StatusSummary.Of(model); return (s.Sentence, s.Glyph); }, model.Pairs, () => { }, () => { }, () => { }, () => { }, () => "0.3.0", () => { });
                 setup = () => { var o = blank.PointToScreen(new Point(40, 40)); tm.Show((int)o.X, (int)o.Y); };
                 w = blank;
                 break;

@@ -125,7 +125,7 @@ internal sealed class TrayMenu
         var allPaused = pairs.Count > 0 && pairs.All(p => p.Paused);
         m.Items.Add(allPaused ? Item("Resume syncing", "", _togglePause) : Item("Pause syncing", "", _togglePause));
         m.Items.Add(new Separator());
-        if (_updated() != null) m.Items.Add(Item("Restart to update", "", _restart));
+        if (_updated() is { } v) m.Items.Add(Item($"Restart to update ({v})", "", _restart));   // Download glyph
         m.Items.Add(Item("Quit", "", _quit));
         return m;
     }

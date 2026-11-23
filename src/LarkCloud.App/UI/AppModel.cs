@@ -34,6 +34,11 @@ internal interface IAppModel
     void SignInOrOut();
     void OpenCheck();
     void OpenLog();
+
+    UpdateStatus UpdateStatus { get; }
+    event Action? UpdateChanged;               // may be raised on any thread
+    Task CheckForUpdates();                    // on demand; progress and result arrive through UpdateStatus
+    void RestartToUpdate();
     bool StartsWithWindows { get; set; }
 
     /// <summary>The settings page reads effective values and locks from here and saves the person's choices with SetMine.</summary>

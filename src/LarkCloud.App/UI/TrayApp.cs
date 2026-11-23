@@ -22,6 +22,7 @@ internal sealed class TrayApp : IAppModel, IDisposable
     MainWindow? _main;
     SyncState _shown = (SyncState)(-1);
     int _shownSize;
+    bool _shownUpdate;
     readonly DispatcherTimer _spin = new() { Interval = TimeSpan.FromMilliseconds(110) };   // runs only while syncing, and only with animation effects on
     int _frame;
     readonly Updater _updater = new();
@@ -43,12 +44,12 @@ internal sealed class TrayApp : IAppModel, IDisposable
         Theme.Mode = Theme.ModeOf(_svc.Config.Theme);
         _tick.Tick += (_, _) => RefreshIcon();
         _tick.Start();
-        _spin.Tick += (_, _) => { var f = TrayIcons.SyncingFrames(_shownSize); _icon.Icon = f[++_frame % f.Length]; };
+        _spin.Tick += (_, _) => { var f = TrayIcons.SyncingFrames(_shownSize, _shownUpdate); _icon.Icon = f[++_frame % f.Length]; };
         Motion.Changed += RefreshIcon;                 // Windows animation effects switched on or off
 
         if (!StartsWithWindows && !File.Exists(Path.Combine(AppPaths.DataDir, "startup-asked"))) { StartsWithWindows = true; File.WriteAllText(Path.Combine(AppPaths.DataDir, "startup-asked"), "1"); }
 
-        _updater.Ready += v => Ui_(() => Balloon($"Update {v} installed. Restart Lark Cloud Drive to use it.", ToolTipIcon.Info));
+        _updater.Ready += _ => Ui_(RefreshIcon);       // the badge on the tray icon; no notification
         _updater.Start();
 
         Ui_(FirstRun);
@@ -89,7 +90,8 @@ internal sealed class TrayApp : IAppModel, IDisposable
     {
         var (state, msg) = _svc.Auth.SignedIn ? _svc.Combined() : (SyncState.Error, "Not signed in – click to sign in");
         var size = TrayIcons.TraySize;
-        if (state != _shown || size != _shownSize) { _icon.Icon = TrayIcons.State(state, size); _shown = state; _shownSize = size; }
+        var update = _updater.Installed != null;
+        if (state != _shown || size != _shownSize || update != _shownUpdate) { _icon.Icon = TrayIcons.State(state, size, update); _shown = state; _shownSize = size; _shownUpdate = update; }
         SetSpinning((state is SyncState.Syncing or SyncState.Starting) && Motion.Enabled);
         var tip = $"{AppPaths.AppTitle}\n{msg}";
         _icon.Text = tip.Length > 127 ? tip[..124] + "…" : tip;
@@ -100,7 +102,7 @@ internal sealed class TrayApp : IAppModel, IDisposable
     {
         if (on == _spin.IsEnabled) return;
         if (on) { _frame = 0; _spin.Start(); }
-        else { _spin.Stop(); _icon.Icon = TrayIcons.State(_shown, _shownSize); }
+        else { _spin.Stop(); _icon.Icon = TrayIcons.State(_shown, _shownSize, _shownUpdate); }
     }
 
     (string, string) MenuStatus() { var s = StatusSummary.Of(this); return (s.Sentence, s.Glyph); }   // same words and icon as the main window
@@ -195,6 +197,9 @@ internal sealed class TrayApp : IAppModel, IDisposable
         ShowModal(new DeletionsDialog(this, pairId));
     });
     public void OpenCheck() => Ui_(() => ShowOnce("check", () => new CheckDialog(run => FeatureCheck.Run(_svc, run), _svc.Auth.UserName)));
+    public UpdateStatus UpdateStatus => _updater.Status;
+    public event Action? UpdateChanged { add => _updater.Changed += value; remove => _updater.Changed -= value; }
+    public Task CheckForUpdates() => _updater.CheckNowAsync();
     public void OpenLog() { if (Log.FilePath is { } p && File.Exists(p)) Ui.Open(p); }
 
     public void SignInOrOut()
@@ -233,7 +238,7 @@ internal sealed class TrayApp : IAppModel, IDisposable
         Shutdown();
     }
 
-    void RestartToUpdate()
+    public void RestartToUpdate()
     {
         try
         {

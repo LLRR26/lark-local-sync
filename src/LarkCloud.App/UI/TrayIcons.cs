@@ -71,34 +71,35 @@ internal static class TrayIcons
     }
 
     // ---------------------------------------------------------------- tray icon with a status dot
-    static readonly Dictionary<(SyncState, int), Icon> Cache = new();
+    static readonly Dictionary<(SyncState, int, bool), Icon> Cache = new();
 
-    public static Icon State(SyncState s, int px)
+    /// <summary>The status icon; <paramref name="update"/> adds the purple "update waiting" badge in the top-left corner.</summary>
+    public static Icon State(SyncState s, int px, bool update = false)
     {
         lock (Cache)
         {
-            if (!Cache.TryGetValue((s, px), out var ic)) Cache[(s, px)] = ic = Render(px, s);
+            if (!Cache.TryGetValue((s, px, update), out var ic)) Cache[(s, px, update)] = ic = Render(px, s, null, update);
             return ic;
         }
     }
 
     // ---------------------------------------------------------------- "syncing" animation frames
     public const int SpinFrames = 12;
-    static readonly Dictionary<int, Icon[]> Spin = new();
+    static readonly Dictionary<(int, bool), Icon[]> Spin = new();
 
     /// <summary>The syncing icon with the arrow in its blue dot turned a twelfth of a turn further in each frame. Drawn once per icon
     /// size and kept for the life of the app (about a dozen small icons per size), so cycling them creates no new GDI handles.</summary>
-    public static Icon[] SyncingFrames(int px)
+    public static Icon[] SyncingFrames(int px, bool update = false)
     {
         lock (Spin)
         {
-            if (!Spin.TryGetValue(px, out var frames))
-                Spin[px] = frames = Enumerable.Range(0, SpinFrames).Select(i => Render(px, SyncState.Syncing, i * 360f / SpinFrames)).ToArray();
+            if (!Spin.TryGetValue((px, update), out var frames))
+                Spin[(px, update)] = frames = Enumerable.Range(0, SpinFrames).Select(i => Render(px, SyncState.Syncing, i * 360f / SpinFrames, update)).ToArray();
             return frames;
         }
     }
 
-    static Icon Render(int px, SyncState? state, float? turn = null)
+    internal static Icon Render(int px, SyncState? state, float? turn = null, bool update = false)
     {
         using var bmp = new Bitmap(px, px);
         using (var g = Graphics.FromImage(bmp))
@@ -110,8 +111,23 @@ internal static class TrayIcons
             using (var frame = Frame(px)) using (var fb = frame.ToBitmap())
                 g.DrawImage(fb, 0, 0, px, px);
             if (state is { } s) DrawDot(g, px, s, turn);
+            if (update) DrawBadge(g, px);
         }
         return Icon.FromHandle(bmp.GetHicon());
+    }
+
+    /// <summary>"An update is waiting": purple dot with a white ring and an up arrow, top-left (the status dot is bottom-right).</summary>
+    static void DrawBadge(Graphics g, int px)
+    {
+        var d = px * (px < 24 ? 0.34f : 0.42f);             // smaller at 16 px, so the cloud still shows between badge and status dot
+        const float x = 0.5f, y = 0.5f;
+        using (var ring = new SolidBrush(Color.White)) g.FillEllipse(ring, x - 1, y - 1, d + 2, d + 2);
+        using (var dot = new SolidBrush(Color.FromArgb(124, 58, 237))) g.FillEllipse(dot, x, y, d, d);
+        if (d < 9) return;                                   // too small for an arrow; the colour alone says "new"
+        using var pen = new Pen(Color.White, Math.Max(1.4f, d / 6.5f)) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round };
+        float cx = x + d / 2, cy = y + d / 2, u = d / 10;
+        g.DrawLine(pen, cx, cy + 2.4f * u, cx, cy - 2.4f * u);
+        g.DrawLines(pen, new[] { new PointF(cx - 2.2f * u, cy - 0.2f * u), new PointF(cx, cy - 2.4f * u), new PointF(cx + 2.2f * u, cy - 0.2f * u) });
     }
 
     static void DrawDot(Graphics g, int px, SyncState s, float? turn = null)
