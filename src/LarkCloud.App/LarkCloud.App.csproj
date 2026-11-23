@@ -12,7 +12,7 @@
     <AssemblyName>LarkCloud</AssemblyName>
     <RootNamespace>LarkCloud.App</RootNamespace>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
     <Product>Lark Cloud Drive</Product>
     <Company>Revion Land IT</Company>
